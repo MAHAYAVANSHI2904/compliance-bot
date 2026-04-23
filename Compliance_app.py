@@ -29,7 +29,6 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-# Path Setup
 POPPLER_PATH = None 
 
 TDS_RULES = {
@@ -50,7 +49,6 @@ def extract_raw_data(file):
             for table in tables:
                 for row in table:
                     all_text += " | ".join([str(cell) for cell in row if cell]) + "\n"
-    
     if len(all_text.strip()) < 100:
         images = convert_from_bytes(f_bytes, poppler_path=POPPLER_PATH)
         all_text = " ".join([pytesseract.image_to_string(img) for img in images])
@@ -58,20 +56,20 @@ def extract_raw_data(file):
 
 def get_vendor_assured(text):
     t = text.lower()
-    if "reliance jio" in t or "jio platforms" in t: return "Reliance Jio Infocomm Ltd"
+    if "reliance jio" in t: return "Reliance Jio Infocomm Ltd"
     if "karix" in t: return "Karix Mobile Pvt Ltd"
     if "decfin" in t: return "Decfin Tech Pvt Ltd"
     if "shivtel" in t or "fonada" in t: return "Shivtel Communications"
-    if "tata tele" in t or "ttns" in t: return "Tata Tele Business Services"
+    if "tata tele" in t: return "Tata Tele Business Services"
     return "Unknown Vendor"
 
 def parse_financials(text, vendor):
     data = {"base": 0.0, "cgst": 0.0, "sgst": 0.0, "igst": 0.0, "sec": "194C", "date": "Not Detected"}
     
-    # IMPROVED DATE EXTRACTION
+    # PRECISION DATE DETECTION
     date_patterns = [
-        r"(?:Invoice|Bill|Statement|Date)\s*(?:Date)?\s*[:\|-]?\s*(\d{1,2}[-\/\s]\w{3,9}[-\/\s]\d{2,4})",
-        r"(?:Invoice|Bill|Statement|Date)\s*(?:Date)?\s*[:\|-]?\s*(\d{1,2}/\d{1,2}/\d{2,4})"
+        r"(?:Invoice|Bill|Date)\s*(?:Date)?\s*[:\|-]?\s*(\d{1,2}[-\/\s]\w{3,9}[-\/\s]\d{2,4})",
+        r"(?:Invoice|Bill|Date)\s*(?:Date)?\s*[:\|-]?\s*(\d{1,2}/\d{1,2}/\d{2,4})"
     ]
     for p in date_patterns:
         match = re.search(p, text, re.IGNORECASE)
@@ -80,7 +78,8 @@ def parse_financials(text, vendor):
             break
 
     # VENDOR SPECIFIC DATA CAPTURE
-    if "shivtel" in vendor.lower() or "fonada" in text.lower():
+    t_low = text.lower()
+    if "shivtel" in vendor.lower() or "fonada" in t_low:
         match = re.search(r"Sub Total\s*(?:\|)?\s*([\d,]+\.\d{2})", text)
         if match: data["base"] = float(match.group(1).replace(',', ''))
     elif "jio" in vendor.lower():
@@ -94,32 +93,24 @@ def parse_financials(text, vendor):
         match = re.search(r"(?:Sub Total|Taxable Amount)\s*(?:\(INR\))?\s*(?:\|)?\s*([\d,]+\.\d{2})", text, re.IGNORECASE)
         if match: data["base"] = float(match.group(1).replace(',', ''))
 
+    # GST CAPTURE
     data["cgst"] = sum([float(x.replace(',','')) for x in re.findall(r"CGST.*?([\d,]+\.\d{2})", text, re.IGNORECASE)])
     data["sgst"] = sum([float(x.replace(',','')) for x in re.findall(r"SGST.*?([\d,]+\.\d{2})", text, re.IGNORECASE)])
     data["igst"] = sum([float(x.replace(',','')) for x in re.findall(r"IGST.*?([\d,]+\.\d{2})", text, re.IGNORECASE)])
 
     return data
 
-# --- 3. CLOUD LOGGING FUNCTION ---
 def log_to_gsheet(user, action):
     try:
         conn = st.connection("gsheets", type=GSheetsConnection)
-        try:
-            df_existing = conn.read(ttl=0)
-        except:
-            df_existing = pd.DataFrame(columns=["Timestamp", "User", "Action"])
-        
-        new_log = pd.DataFrame([{
-            "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "User": user,
-            "Action": action
-        }])
+        df_existing = conn.read(ttl=0)
+        new_log = pd.DataFrame([{"Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "User": user, "Action": action}])
         updated_df = pd.concat([df_existing, new_log], ignore_index=True)
         conn.update(data=updated_df)
-    except Exception as e:
-        st.sidebar.error(f"GSheet Log Error: {e}")
+    except:
+        pass
 
-# --- 4. ACCESS CONTROL ---
+# --- 3. DUAL LOGIN & DASHBOARD ---
 if 'auth' not in st.session_state: st.session_state['auth'] = None
 
 with st.sidebar:
@@ -140,17 +131,13 @@ with st.sidebar:
                 st.session_state.update({"auth": "Developer", "user": "Chirag"})
                 log_to_gsheet("Chirag", "Developer Login")
                 st.rerun()
-            else: st.error("Invalid Credentials")
 
 if not st.session_state['auth']:
     st.title("Compliance Intelligence Hub")
-    st.info("Log in to proceed.")
+    st.info("Please log in.")
     st.stop()
 
-# --- 5. MAIN HUB ---
 st.title("Compliance Intelligence Hub")
-st.caption(f"Logged in: {st.session_state['user']} | GSheet Sync Active")
-
 files = st.file_uploader("Upload Invoices", accept_multiple_files=True, type=['pdf'])
 
 if st.button("Proceed") and files:
@@ -177,27 +164,12 @@ if st.button("Proceed") and files:
             "TDS Section": sec if is_app else "NA",
             "TDS Deducted": tds_amt if is_app else "NA",
             "TDS Reason": f"Applicable (> {TDS_RULES[sec]['limit']})" if is_app else f"Below Limit (< {TDS_RULES[sec]['limit']})",
-            "GST Reason": "Forward Charge" if total_tax > 0 else "Exempt/RCM",
             "Journal": [
                 {"Account": "Expense A/c", "Dr": vals["base"], "Cr": 0},
-                {"Account": "GST Input A/c", "Dr": total_tax if total_tax > 0 else 0, "Cr": 0},
+                {"Account": "GST Input A/c", "Dr": total_tax, "Cr": 0},
                 {"Account": "TDS Payable A/c", "Dr": 0, "Cr": tds_amt if is_app else 0},
                 {"Account": "Vendor Payable A/c", "Dr": 0, "Cr": (vals["base"]+total_tax)-tds_amt}
             ]
         })
-
     st.dataframe(pd.DataFrame(results).drop(columns=["Journal"]), use_container_width=True, hide_index=True)
-
-    st.subheader("Journal Entries")
-    cols = st.columns(2)
-    for i, res in enumerate(results):
-        with cols[i%2].expander(f"Entry: {res['Name of Vendor']} ({res['File Name']})"):
-            st.table(pd.DataFrame(res["Journal"]))
-
-    log_to_gsheet(st.session_state['user'], f"Audit Processed: {len(files)} files")
-
-if st.session_state['auth'] == "Developer":
-    st.sidebar.markdown("---")
-    if st.sidebar.checkbox("View Real-time Cloud Logs"):
-        conn = st.connection("gsheets", type=GSheetsConnection)
-        st.sidebar.dataframe(conn.read(ttl=0).tail(15))
+    log_to_gsheet(st.session_state['user'], f"Audit: {len(files)} files")
