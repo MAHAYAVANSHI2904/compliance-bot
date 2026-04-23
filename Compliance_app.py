@@ -8,53 +8,43 @@ import os
 from datetime import datetime
 from streamlit_gsheets import GSheetsConnection
 
-# --- 1. SYSTEM CONFIGURATION & UI ---
+# --- 1. CONFIGURATION & UI RESTORATION ---
 st.set_page_config(page_title="Compliance Intelligence Hub", layout="wide")
 
+# Restoring the Full Onyx UI with Green Highlights
 st.markdown("""
     <style>
     .stApp { background-color: #000000; color: #ffffff; }
-    [data-testid="stSidebar"] { background-color: #0a0a0a; border-right: 1px solid #1ed760; }
+    [data-testid="stSidebar"] { background-color: #0a0a0a; border-right: 2px solid #1ed760; }
     .stButton>button { 
         background-color: #1ed760 !important; 
         color: black !important; 
         font-weight: bold !important; 
         border-radius: 5px !important;
-        width: 100%;
     }
-    .stTextInput>div>div>input { background-color: #121212; color: #ffffff; border: 1px solid #333; }
     .stDataFrame { border: 1px solid #1ed760; border-radius: 10px; }
     div[data-testid="stExpander"] { background-color: #0a0a0a; border: 1px solid #333; }
-    h1 { color: #1ed760; }
     </style>
     """, unsafe_allow_html=True)
 
-POPPLER_PATH = None 
+TDS_RULES = {"194J": {"rate": 0.10, "limit": 30000}, "194C": {"rate": 0.02, "limit": 30000}}
 
-TDS_RULES = {
-    "194J": {"rate": 0.10, "limit": 30000},
-    "194C": {"rate": 0.02, "limit": 30000},
-    "194I": {"rate": 0.10, "limit": 240000}
-}
-
-# --- 2. PRECISION EXTRACTION ENGINE ---
+# --- 2. EXTRACTION ENGINE ---
 def extract_raw_data(file):
     f_bytes = file.read()
     all_text = ""
     with pdfplumber.open(file) as pdf:
         for page in pdf.pages:
-            tables = page.extract_tables()
-            page_text = page.extract_text() or ""
-            all_text += page_text + "\n"
-            for table in tables:
+            all_text += (page.extract_text() or "") + "\n"
+            for table in page.extract_tables():
                 for row in table:
                     all_text += " | ".join([str(cell) for cell in row if cell]) + "\n"
     if len(all_text.strip()) < 100:
-        images = convert_from_bytes(f_bytes, poppler_path=POPPLER_PATH)
+        images = convert_from_bytes(f_bytes)
         all_text = " ".join([pytesseract.image_to_string(img) for img in images])
     return all_text
 
-def get_vendor_assured(text):
+def get_vendor(text):
     t = text.lower()
     if "reliance jio" in t: return "Reliance Jio Infocomm Ltd"
     if "karix" in t: return "Karix Mobile Pvt Ltd"
@@ -65,8 +55,7 @@ def get_vendor_assured(text):
 
 def parse_financials(text, vendor):
     data = {"base": 0.0, "cgst": 0.0, "sgst": 0.0, "igst": 0.0, "sec": "194C", "date": "Not Detected"}
-    
-    # PRECISION DATE DETECTION
+    # Precision Date Detection
     date_patterns = [
         r"(?:Invoice|Bill|Date)\s*(?:Date)?\s*[:\|-]?\s*(\d{1,2}[-\/\s]\w{3,9}[-\/\s]\d{2,4})",
         r"(?:Invoice|Bill|Date)\s*(?:Date)?\s*[:\|-]?\s*(\d{1,2}/\d{1,2}/\d{2,4})"
@@ -76,100 +65,92 @@ def parse_financials(text, vendor):
         if match:
             data["date"] = match.group(1).strip()
             break
-
-    # VENDOR SPECIFIC DATA CAPTURE
-    t_low = text.lower()
-    if "shivtel" in vendor.lower() or "fonada" in t_low:
-        match = re.search(r"Sub Total\s*(?:\|)?\s*([\d,]+\.\d{2})", text)
-        if match: data["base"] = float(match.group(1).replace(',', ''))
+    
+    # Base Value Logic
+    if "shivtel" in vendor.lower():
+        m = re.search(r"Sub Total\s*(?:\|)?\s*([\d,]+\.\d{2})", text)
+        if m: data["base"] = float(m.group(1).replace(',', ''))
     elif "jio" in vendor.lower():
-        match = re.search(r"Current Taxable Charges\s*(?:\|)?\s*([\d,]+\.\d{2})", text)
-        if match: data["base"] = float(match.group(1).replace(',', ''))
-    elif "karix" in vendor.lower():
-        match = re.search(r"Total Taxable Amount\s*(?:\|)?\s*([\d,]+\.\d{2})", text)
-        if match: data["base"] = float(match.group(1).replace(',', ''))
-        data["sec"] = "194J"
-    elif any(x in vendor.lower() for x in ["decfin", "tata"]):
-        match = re.search(r"(?:Sub Total|Taxable Amount)\s*(?:\(INR\))?\s*(?:\|)?\s*([\d,]+\.\d{2})", text, re.IGNORECASE)
-        if match: data["base"] = float(match.group(1).replace(',', ''))
+        m = re.search(r"Current Taxable Charges\s*(?:\|)?\s*([\d,]+\.\d{2})", text)
+        if m: data["base"] = float(m.group(1).replace(',', ''))
+    else:
+        m = re.search(r"(?:Sub Total|Taxable Amount|Total Value)\s*[:\|-]?\s*([\d,]+\.\d{2})", text, re.IGNORECASE)
+        if m: data["base"] = float(m.group(1).replace(',', ''))
 
-    # GST CAPTURE
     data["cgst"] = sum([float(x.replace(',','')) for x in re.findall(r"CGST.*?([\d,]+\.\d{2})", text, re.IGNORECASE)])
     data["sgst"] = sum([float(x.replace(',','')) for x in re.findall(r"SGST.*?([\d,]+\.\d{2})", text, re.IGNORECASE)])
     data["igst"] = sum([float(x.replace(',','')) for x in re.findall(r"IGST.*?([\d,]+\.\d{2})", text, re.IGNORECASE)])
-
     return data
 
-def log_to_gsheet(user, action):
+# --- 3. UPDATED CLOUD SYNC ---
+def sync_data_to_cloud(results_df):
+    """Writes the entire analysis table to Google Sheets"""
     try:
         conn = st.connection("gsheets", type=GSheetsConnection)
         df_existing = conn.read(ttl=0)
-        new_log = pd.DataFrame([{"Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "User": user, "Action": action}])
-        updated_df = pd.concat([df_existing, new_log], ignore_index=True)
+        updated_df = pd.concat([df_existing, results_df], ignore_index=True)
         conn.update(data=updated_df)
-    except:
-        pass
+        st.success("Cloud Database Updated Successfully!")
+    except Exception as e:
+        st.error(f"Sync Failed: {e}")
 
-# --- 3. DUAL LOGIN & DASHBOARD ---
+# --- 4. MAIN HUB ---
 if 'auth' not in st.session_state: st.session_state['auth'] = None
 
 with st.sidebar:
-    st.markdown("### Access Control")
+    st.title("Access Control")
     with st.expander("Normal Login", expanded=st.session_state['auth'] is None):
-        u_name = st.text_input("Enter Name", key="u_name")
-        if st.button("Proceed", key="u_btn"):
-            if u_name:
-                st.session_state.update({"auth": "User", "user": u_name})
-                log_to_gsheet(u_name, "User Login")
-                st.rerun()
-    st.markdown("---")
-    with st.expander("Developer Login", expanded=False):
-        d_id = st.text_input("User ID", key="d_id")
-        d_pw = st.text_input("Password", type="password", key="d_pw")
-        if st.button("Proceed", key="d_btn"):
-            if d_id == "Chirag" and d_pw == "Chirag":
-                st.session_state.update({"auth": "Developer", "user": "Chirag"})
-                log_to_gsheet("Chirag", "Developer Login")
-                st.rerun()
+        u = st.text_input("Name")
+        if st.button("Proceed", key="user_btn"):
+            st.session_state.update({"auth": "User", "user": u})
+            st.rerun()
+    with st.expander("Developer Login"):
+        du = st.text_input("Dev ID")
+        dp = st.text_input("Pass", type="password")
+        if st.button("Proceed", key="dev_btn") and du == "Chirag":
+            st.session_state.update({"auth": "Developer", "user": "Chirag"})
+            st.rerun()
 
-if not st.session_state['auth']:
-    st.title("Compliance Intelligence Hub")
-    st.info("Please log in.")
-    st.stop()
+if not st.session_state['auth']: st.stop()
 
 st.title("Compliance Intelligence Hub")
 files = st.file_uploader("Upload Invoices", accept_multiple_files=True, type=['pdf'])
 
 if st.button("Proceed") and files:
-    results = []
+    all_data = []
     for idx, f in enumerate(files):
-        raw_text = extract_raw_data(f)
-        v = get_vendor_assured(raw_text)
-        vals = parse_financials(raw_text, v)
-        
+        txt = extract_raw_data(f)
+        v = get_vendor(txt)
+        vals = parse_financials(txt, v)
         total_tax = vals["cgst"] + vals["sgst"] + vals["igst"]
-        sec = vals["sec"]
-        is_app = vals["base"] >= TDS_RULES[sec]["limit"]
-        tds_amt = vals["base"] * TDS_RULES[sec]["rate"] if is_app else 0.0
+        is_app = vals["base"] >= TDS_RULES[vals["sec"]]["limit"]
+        tds = vals["base"] * TDS_RULES[vals["sec"]]["rate"] if is_app else 0.0
 
-        results.append({
-            "Sr. No.": idx + 1,
-            "Name of Vendor": v,
-            "File Name": f.name,
-            "Invoice Date": vals["date"],
-            "Base Value": vals["base"],
-            "CGST": vals["cgst"] if vals["cgst"] > 0 else "NA",
-            "SGST": vals["sgst"] if vals["sgst"] > 0 else "NA",
-            "IGST": vals["igst"] if vals["igst"] > 0 else "NA",
-            "TDS Section": sec if is_app else "NA",
-            "TDS Deducted": tds_amt if is_app else "NA",
-            "TDS Reason": f"Applicable (> {TDS_RULES[sec]['limit']})" if is_app else f"Below Limit (< {TDS_RULES[sec]['limit']})",
-            "Journal": [
-                {"Account": "Expense A/c", "Dr": vals["base"], "Cr": 0},
-                {"Account": "GST Input A/c", "Dr": total_tax, "Cr": 0},
-                {"Account": "TDS Payable A/c", "Dr": 0, "Cr": tds_amt if is_app else 0},
-                {"Account": "Vendor Payable A/c", "Dr": 0, "Cr": (vals["base"]+total_tax)-tds_amt}
-            ]
-        })
-    st.dataframe(pd.DataFrame(results).drop(columns=["Journal"]), use_container_width=True, hide_index=True)
-    log_to_gsheet(st.session_state['user'], f"Audit: {len(files)} files")
+        res = {
+            "Sr. No.": idx + 1, "Vendor": v, "File": f.name, "Date": vals["date"],
+            "Base Value": vals["base"], "CGST": vals["cgst"] or "NA", "SGST": vals["sgst"] or "NA", 
+            "IGST": vals["igst"] or "NA", "TDS Sec": vals["sec"] if is_app else "NA",
+            "TDS Amt": tds if is_app else "NA", "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+        
+        # Restoration of Journal Entries logic
+        res["Journal"] = [
+            {"Ac": "Expense", "Dr": vals["base"], "Cr": 0},
+            {"Ac": "GST In", "Dr": total_tax, "Cr": 0},
+            {"Ac": "TDS Pay", "Dr": 0, "Cr": tds},
+            {"Ac": "Vendor", "Dr": 0, "Cr": (vals["base"] + total_tax) - tds}
+        ]
+        all_data.append(res)
+
+    results_df = pd.DataFrame(all_data)
+    st.dataframe(results_df.drop(columns=["Journal", "Timestamp"]), use_container_width=True, hide_index=True)
+
+    # RESTORED JOURNAL ENTRIES UI
+    st.subheader("Journal Entries")
+    cols = st.columns(2)
+    for i, item in enumerate(all_data):
+        with cols[i%2].expander(f"Post: {item['Vendor']}"):
+            st.table(pd.DataFrame(item["Journal"]))
+
+    # AUTOMATIC FULL SYNC
+    sync_data_to_cloud(results_df.drop(columns=["Journal"]))
