@@ -6,11 +6,173 @@ import json
 import io
 from datetime import datetime
 import gspread
-from compliance_engine import (
-    TDS_RULES, TDS_RULES_FULL, classify_tds_section,
-    validate_gst, validate_tds, compute_compliance_score,
-    get_tds_section_options, get_section_code
-)
+# ============================================================
+# SECTION: TDS & GST COMPLIANCE ENGINE (Merged for Stability)
+# ============================================================
+TDS_RULES_FULL = {
+    "192":   {"desc": "Salary", "rate": 0.0, "limit": 250000,
+              "notes": "Rate per income tax slab. Not applicable to vendor invoices."},
+    "193":   {"desc": "Interest on Securities (Debentures/Bonds)", "rate": 0.10, "limit": 10000,
+              "notes": "10% on interest. Exempt if issued by certain public bodies."},
+    "194":   {"desc": "Dividend from Domestic Company", "rate": 0.10, "limit": 5000,
+              "notes": "10% on dividends. No TDS if dividend < Rs.5,000 p.a."},
+    "194A":  {"desc": "Interest (other than Securities) — FD, Bank, Post Office", "rate": 0.10, "limit": 40000,
+              "notes": "Limit Rs.40,000 for others, Rs.50,000 for senior citizens. Banks, co-ops, post offices."},
+    "194B":  {"desc": "Winnings from Lottery / Crossword Puzzle / Card Game", "rate": 0.30, "limit": 10000,
+              "notes": "30% flat on aggregate winnings > Rs.10,000 in a FY."},
+    "194BB": {"desc": "Winnings from Horse Racing", "rate": 0.30, "limit": 10000,
+              "notes": "30% flat on winnings per race > Rs.10,000."},
+    "194C":  {"desc": "Payment to Contractor / Sub-Contractor / Housekeeping / Transport", "rate": 0.02, "limit": 30000,
+              "notes": "2% for companies/firms, 1% for individual/HUF contractors. Single txn > Rs.30,000 OR annual aggregate > Rs.1,00,000. Transport contractors with PAN: 0%."},
+    "194D":  {"desc": "Insurance Commission", "rate": 0.05, "limit": 15000,
+              "notes": "5% if commission > Rs.15,000 p.a. Applicable to agents/brokers."},
+    "194DA": {"desc": "Life Insurance Policy Maturity Payment", "rate": 0.05, "limit": 100000,
+              "notes": "5% on taxable portion of maturity proceeds. Not applicable if exempt u/s 10(10D)."},
+    "194E":  {"desc": "Payment to Non-Resident Sportsman / Artist / Association", "rate": 0.20, "limit": 0,
+              "notes": "20% flat. No threshold. Applicable on all payments."},
+    "194EE": {"desc": "Payment from National Savings Scheme (NSS)", "rate": 0.10, "limit": 2500,
+              "notes": "10% on withdrawal > Rs.2,500."},
+    "194F":  {"desc": "Repurchase of Units by Mutual Fund / UTI", "rate": 0.20, "limit": 0,
+              "notes": "20% flat. Deducted at source by the fund."},
+    "194G":  {"desc": "Commission on Sale of Lottery Tickets", "rate": 0.05, "limit": 15000,
+              "notes": "5% on commission > Rs.15,000 p.a."},
+    "194H":  {"desc": "Commission or Brokerage (Not insurance/securities)", "rate": 0.05, "limit": 15000,
+              "notes": "5% on brokerage/commission > Rs.15,000 p.a. Not applicable on insurance/stock exchange commissions."},
+    "194I":  {"desc": "Rent — Land, Building, Furniture & Fittings", "rate": 0.10, "limit": 240000,
+              "notes": "10% on rent for land/building/furniture. 2% for Plant & Machinery. Threshold: Rs.2,40,000 p.a. (Rs.20,000/month effective)."},
+    "194IA": {"desc": "TDS on Purchase of Immovable Property (Non-Agricultural)", "rate": 0.01, "limit": 5000000,
+              "notes": "1% on property purchase > Rs.50 Lakh. Buyer deducts, files Form 26QB. PAN mandatory."},
+    "194IB": {"desc": "Rent by Individual/HUF (not tax audit liable) — High Rent", "rate": 0.05, "limit": 50000,
+              "notes": "5% if monthly rent > Rs.50,000. Deducted once at year-end or lease termination."},
+    "194IC": {"desc": "Payment under Joint Development Agreement (JDA)", "rate": 0.10, "limit": 0,
+              "notes": "10% on any cash/monetary consideration paid to land owner under JDA. No threshold."},
+    "194J":  {"desc": "Professional / Technical Services / Director Fees / Royalty", "rate": 0.10, "limit": 30000,
+              "notes": "10% for professional fees, director fees, royalty. 2% for technical services, call centres. Director fees: NO threshold (deduct from Rs.1). Threshold Rs.30,000 p.a. for others."},
+    "194K":  {"desc": "Income from Units of Mutual Funds", "rate": 0.10, "limit": 5000,
+              "notes": "10% on income/dividend from MF units > Rs.5,000 p.a."},
+    "194LA": {"desc": "Compensation on Compulsory Acquisition of Immovable Property", "rate": 0.10, "limit": 250000,
+              "notes": "10% if compensation > Rs.2.5 Lakh. Exempt if agricultural land."},
+    "194LB": {"desc": "Interest from Infrastructure Debt Fund (NRI)", "rate": 0.05, "limit": 0,
+              "notes": "5% for NRIs investing in notified infrastructure debt funds."},
+    "194LC": {"desc": "Interest from Indian Company / Business Trust — Long-term Bonds (NRI)", "rate": 0.05, "limit": 0,
+              "notes": "5% for NRIs on interest from long-term bonds listed on recognised stock exchange."},
+    "194LD": {"desc": "Interest on Rupee-Denominated Bonds / Govt Securities (FII/QFI)", "rate": 0.05, "limit": 0,
+              "notes": "5% for Foreign Institutional Investors / Qualified Foreign Investors."},
+    "194M":  {"desc": "Payment by Individual/HUF to Contractor or Professional > Rs.50L", "rate": 0.05, "limit": 5000000,
+              "notes": "5% when individual/HUF NOT liable for tax audit pays contractor/professional > Rs.50L p.a. File via Form 26QD."},
+    "194N":  {"desc": "Cash Withdrawal from Bank / Post Office above threshold", "rate": 0.02, "limit": 2000000,
+              "notes": "2% on cash withdrawal above Rs.20L (if ITR filed in last 3 yrs). 5% if ITR not filed for 3 consecutive years. Above Rs.1 Cr: always 2%."},
+    "194O":  {"desc": "TDS on E-Commerce Participants (by e-commerce operators)", "rate": 0.01, "limit": 500000,
+              "notes": "1% on gross sales/services facilitated through e-commerce platform. Threshold Rs.5L p.a. for individuals/HUF."},
+    "194P":  {"desc": "TDS on Senior Citizens aged 75+ (Pension + Interest — Bank)", "rate": 0.0, "limit": 0,
+              "notes": "Specified bank computes tax on pension+interest, deducts TDS. Rate per slab. No separate return filing needed."},
+    "194Q":  {"desc": "TDS on Purchase of Goods above Rs.50L (Buyer's obligation)", "rate": 0.001, "limit": 5000000,
+              "notes": "0.1% on purchase value above Rs.50L p.a. from a seller whose turnover > Rs.10 Cr. Not applicable if seller deducts TCS u/s 206C(1H)."},
+    "194R":  {"desc": "TDS on Benefit / Perquisite from Business or Profession", "rate": 0.10, "limit": 20000,
+              "notes": "10% on FMV of benefit/perquisite given to resident > Rs.20,000 p.a. Covers free samples, gifts, vouchers, sponsored trips."},
+    "194S":  {"desc": "TDS on Transfer of Virtual Digital Asset (Crypto / NFT)", "rate": 0.01, "limit": 10000,
+              "notes": "1% on consideration for transfer of VDA. Threshold Rs.10,000 p.a. (Rs.50,000 for specified persons). No deduction for losses."},
+    "194T":  {"desc": "Payment by Partnership Firm to Partners", "rate": 0.10, "limit": 20000,
+              "notes": "10% on salary, bonus, commission, interest paid to partners > Rs.20,000 p.a. w.e.f. 01-Apr-2025."},
+    "195":   {"desc": "Payment to Non-Resident / Foreign Company (Other Income)", "rate": 0.30, "limit": 0,
+              "notes": "30% or DTAA rate (whichever is lower with Form 10F/15CB). Covers royalty, FTS, capital gains, interest, etc. No threshold."},
+    "196B":  {"desc": "Income from Units (Offshore Fund) — Non-Resident", "rate": 0.10, "limit": 0,
+              "notes": "10% on income/long-term capital gain from units of offshore fund."},
+    "196C":  {"desc": "Income from Foreign Currency Bonds / GDRs — Non-Resident", "rate": 0.10, "limit": 0,
+              "notes": "10% on income/LTCG from foreign currency bonds or GDRs."},
+    "196D":  {"desc": "Income from Securities — Foreign Institutional Investors (FII)", "rate": 0.20, "limit": 0,
+              "notes": "20% on income (not capital gains) from securities held by FIIs/FPIs."},
+}
+
+TDS_RULES = {sec: {"rate": info["rate"], "limit": info["limit"]} for sec, info in TDS_RULES_FULL.items()}
+
+TDS_KEYWORD_MAP = [
+    (["rent", "lease", "leave and license", "rental", "renting of premises", "office space", "accommodation", "leave & license"], "194I", 90),
+    (["professional", "consultancy", "advisory", "legal", "audit", "chartered accountant", "architect", "interior design", "software development", "software license", "technology fee", "subscription fee", "platform fee", "saas", "royalty", "intellectual property", "bse", "exchange", "annual listing fee", "convin", "feed forward", "karix", "telecom software", "management fee", "technical support"], "194J", 85),
+    (["contractor", "sub-contractor", "housekeeping", "cleaning", "facility management", "manpower", "security", "catering", "printing", "advertising", "transport", "logistics", "freight", "courier", "rudra", "rlfs", "labour supply", "staffing", "civil work", "repair", "maintenance"], "194C", 80),
+    (["commission", "brokerage", "referral fee", "agent fee", "distribution fee"], "194H", 75),
+    (["e-commerce", "amazon", "flipkart", "marketplace", "online platform", "meesho", "nykaa", "myntra"], "194O", 75),
+    (["jio", "airtel", "vodafone", "bsnl", "broadband", "tata tele", "tata teleservices", "fonada", "shivtel", "internet service", "data service"], "194J", 80),
+    (["dividend"], "194", 80),
+    (["interest on fd", "interest on deposit", "bank interest", "fd interest", "fixed deposit interest"], "194A", 80),
+    (["purchase of goods", "supply of goods", "goods purchase"], "194Q", 70),
+    (["immovable property", "purchase of flat", "purchase of plot", "land purchase", "property purchase"], "194IA", 90),
+    (["crypto", "virtual digital asset", "vda", "bitcoin", "ethereum", "nft", "web3"], "194S", 95),
+    (["insurance commission", "life insurance commission"], "194D", 90),
+    (["benefit", "perquisite", "free sample", "gift voucher", "sponsored trip", "sponsored event"], "194R", 75),
+    (["partner salary", "partner interest", "profit sharing", "partner commission", "partnership firm payment"], "194T", 80),
+    (["nri", "foreign payment", "overseas", "remittance", "foreign company", "non-resident"], "195", 85),
+    (["joint development", "jda", "land owner"], "194IC", 90),
+    (["cash withdrawal", "atm withdrawal"], "194N", 90),
+]
+
+VALID_GST_RATES_PCT = {0, 5, 12, 18, 28, 40, 3, 6, 9, 14}
+RCM_KEYWORDS = ["gta", "goods transport agency", "freight", "advocate", "legal service", "director service", "import of service", "foreign service", "sponsorship", "arbitral tribunal", "renting of motor vehicle", "security service", "support service government", "director fees"]
+ITC_BLOCKED_KEYWORDS = ["motor vehicle", "passenger vehicle", "outdoor catering", "beauty treatment", "health service", "cosmetic surgery", "membership of club", "gym membership", "travel benefit", "life insurance", "health insurance", "construction of building", "works contract for immovable", "free sample", "gift"]
+EXEMPT_SUPPLY_KEYWORDS = ["hospital", "healthcare", "education", "school", "university", "college", "government service", "municipal", "electricity", "potable water"]
+GSTIN_REGEX = re.compile(r"\b(\d{2}[A-Z]{5}\d{4}[A-Z]{1}[A-Z\d]{1}Z[A-Z\d]{1})\b")
+
+def validate_gstin(gstin: str) -> tuple[bool, str]:
+    if not gstin or len(gstin) != 15: return False, f"Invalid length. Must be 15 chars."
+    if not GSTIN_REGEX.match(gstin.upper()): return False, "Format invalid."
+    state_code = int(gstin[:2])
+    if not (1 <= state_code <= 38): return False, f"Invalid state code {state_code}."
+    return True, f"Valid format."
+
+def extract_gstin(text: str) -> str | None:
+    match = GSTIN_REGEX.search(text.upper())
+    return match.group(1) if match else None
+
+def validate_gst(base, cgst, sgst, igst, invoice_text=""):
+    results = {}
+    total_gst = cgst + sgst + igst
+    if cgst > 0 and sgst > 0:
+        ok = abs(cgst - sgst) < 1.0
+        results["G1_CGST_EQUALS_SGST"] = (ok, "CGST matches SGST" if ok else "CGST mismatch SGST")
+    results["G2_TAX_EXCLUSIVITY"] = (not (igst > 0 and (cgst > 0 or sgst > 0)), "Tax exclusivity compliant")
+    if base > 0 and total_gst > 0:
+        eff_rate = round((total_gst / base) * 100)
+        results["G3_VALID_GST_RATE"] = (eff_rate in VALID_GST_RATES_PCT, f"Rate {eff_rate}% check")
+    results["G4_GST_BELOW_BASE"] = (total_gst <= base if base > 0 else True, "GST vs Base check")
+    results["G5_NO_NEGATIVES"] = (all(v >= 0 for v in [base, cgst, sgst, igst]), "Negative value check")
+    gstin = extract_gstin(invoice_text)
+    if gstin: results["G6_GSTIN_VALID"] = validate_gstin(gstin)
+    return results
+
+def validate_tds(base, tds_section, tds_deducted, tds_amt, invoice_text="", invoice_date=""):
+    results = {}
+    rule = TDS_RULES_FULL.get(tds_section, TDS_RULES_FULL["194C"])
+    threshold = rule["limit"]
+    rate = rule["rate"]
+    if base >= threshold or threshold == 0:
+        results["T1_THRESHOLD"] = (tds_deducted, f"TDS deduction check vs threshold {threshold}")
+    if tds_deducted and base > 0 and rate > 0:
+        actual = round(tds_amt / base, 4)
+        ok = abs(actual - rate) < 0.005
+        results["T2_TDS_RATE"] = (ok, f"Rate {actual*100:.1f}% check vs {rate*100:.1f}%")
+    return results
+
+def compute_compliance_score(gst_res, tds_res):
+    total, passed = 0, 0
+    for status, _ in {**gst_res, **tds_res}.values():
+        if status is True: passed += 1; total += 1
+        elif status is False: total += 1
+    score = int((passed / total) * 100) if total > 0 else 100
+    if score >= 90: label = "🟢 Fully Compliant"
+    elif score >= 70: label = "🟡 Minor Issues"
+    else: label = "🔴 Review Required"
+    return score, f"{label} ({score}/100)"
+
+def classify_tds_section(text, vendor=""):
+    combined = (text + " " + vendor).lower()
+    best_sec, best_score = "194C", 0
+    for keywords, section, score in TDS_KEYWORD_MAP:
+        if any(kw in combined for kw in keywords):
+            if score > best_score: best_score, best_sec = score, section
+    return best_sec, best_score
+
+def get_tds_section_options(): return [f"{sec} - {info['desc'][:65]}" for sec, info in TDS_RULES_FULL.items()]
+def get_section_code(display): return display.split(" - ")[0].strip()
 
 try:
     import easyocr
