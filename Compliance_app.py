@@ -25,12 +25,19 @@ def get_ocr_reader():
 def init_log_connection():
     import os
     try:
-        # Windows sometimes hides file extensions, causing 'credentials.json.json'
-        filename = 'credentials.json'
-        if not os.path.exists(filename) and os.path.exists('credentials.json.json'):
-            filename = 'credentials.json.json'
+        # Check for Streamlit Secrets first (for Streamlit Cloud)
+        if "gcp_service_account" in st.secrets:
+            # st.secrets["gcp_service_account"] is a dictionary-like object
+            credentials_dict = dict(st.secrets["gcp_service_account"])
+            gc = gspread.service_account_from_dict(credentials_dict)
+        else:
+            # Fallback to local files
+            filename = 'credentials.json'
+            if not os.path.exists(filename) and os.path.exists('credentials.json.json'):
+                filename = 'credentials.json.json'
+                
+            gc = gspread.service_account(filename=filename)
             
-        gc = gspread.service_account(filename=filename)
         sh = gc.open_by_url("https://docs.google.com/spreadsheets/d/1j7U1Kw0NG2I77V19S0vIRqDqIFYCFdXIPE7wSDSfulQ/edit")
         return sh.sheet1
     except Exception as e:
@@ -231,7 +238,11 @@ with st.sidebar:
         with st.expander("Developer"):
             dev_id = st.text_input("Dev ID")
             dev_pass = st.text_input("Password", type="password")
-            if st.button("Unlock Dev") and dev_id == "Chirag" and dev_pass == "1234":
+            
+            # Securely fetch developer password from Streamlit secrets (fallback to '1234' locally)
+            expected_pass = st.secrets.get("dev_password", "1234")
+            
+            if st.button("Unlock Dev") and dev_id == "Chirag" and dev_pass == expected_pass:
                 if isinstance(log_worksheet, str):
                     st.error(f"Cannot log in: Google Sheets connection failed. Details: {log_worksheet}")
                 else:
