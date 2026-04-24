@@ -26,15 +26,20 @@ def init_log_connection():
     import os
     try:
         # Check for Streamlit Secrets first (for Streamlit Cloud)
-        if "gcp_service_account" in st.secrets:
-            # st.secrets["gcp_service_account"] is a dictionary-like object
+        if "connections" in st.secrets and "gsheets" in st.secrets["connections"]:
+            # st.secrets["connections"]["gsheets"] used by st-gsheets-connection
+            credentials_dict = dict(st.secrets["connections"]["gsheets"])
+            credentials_dict.pop("spreadsheet", None) # remove non-gcp keys
+            gc = gspread.service_account_from_dict(credentials_dict)
+        elif "gcp_service_account" in st.secrets:
             credentials_dict = dict(st.secrets["gcp_service_account"])
             gc = gspread.service_account_from_dict(credentials_dict)
         else:
-            # Fallback to local files
-            filename = 'credentials.json'
-            if not os.path.exists(filename) and os.path.exists('credentials.json.json'):
-                filename = 'credentials.json.json'
+            # Fallback to local files, resolving path relative to this script
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            filename = os.path.join(script_dir, 'credentials.json')
+            if not os.path.exists(filename) and os.path.exists(os.path.join(script_dir, 'credentials.json.json')):
+                filename = os.path.join(script_dir, 'credentials.json.json')
                 
             gc = gspread.service_account(filename=filename)
             
