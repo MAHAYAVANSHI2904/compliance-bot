@@ -9,3 +9,5 @@ numpy
 opencv-python-headless
 google-generativeai
 groq
+fpdf
+plotly
