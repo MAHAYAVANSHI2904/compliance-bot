@@ -3,3 +3,7 @@ pandas
 pdfplumber
 st-gsheets-connection
 cryptography
+gspread
+easyocr
+numpy
+opencv-python-headless
