@@ -435,6 +435,14 @@ if st.button("Proceed") and files:
                 if ai_vals["date"] != "Not Detected": vals["date"] = ai_vals["date"]
                 vals["sec"] = ai_vals["sec"]
         
+        # 4. Strict Validation: Mutual Exclusivity of Taxes
+        # An invoice cannot have both IGST and CGST/SGST. We keep whichever tax amount is larger.
+        if (vals["cgst"] + vals["sgst"]) > vals["igst"]:
+            vals["igst"] = 0.0
+        elif vals["igst"] > 0:
+            vals["cgst"] = 0.0
+            vals["sgst"] = 0.0
+        
         if vals["base"] == 0.0:
             st.warning(f"Could not automatically detect Base Value for {f.name}. Saving to 'Failed_Invoices' for developer review.")
             failed_invoices.append([f.name, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), txt])
