@@ -14,6 +14,18 @@ try:
 except ImportError:
     HAS_EASYOCR = False
 
+try:
+    import google.generativeai as genai
+    HAS_GEMINI = True
+except ImportError:
+    HAS_GEMINI = False
+
+try:
+    from groq import Groq
+    HAS_GROQ = True
+except ImportError:
+    HAS_GROQ = False
+
 @st.cache_resource
 def get_ocr_reader():
     if HAS_EASYOCR:
@@ -44,7 +56,12 @@ def init_log_connection():
             gc = gspread.service_account(filename=filename)
             
         sh = gc.open_by_url("https://docs.google.com/spreadsheets/d/1j7U1Kw0NG2I77V19S0vIRqDqIFYCFdXIPE7wSDSfulQ/edit")
-        return sh.sheet1
+        try:
+            log_ws = sh.worksheet("Login_Logs")
+        except Exception:
+            log_ws = sh.add_worksheet(title="Login_Logs", rows=1000, cols=2)
+            log_ws.append_row(["User", "Timestamp"])
+        return log_ws
     except Exception as e:
         return str(e)
 
@@ -61,11 +78,29 @@ except ImportError:
 st.set_page_config(page_title="Compliance Intelligence Hub", layout="wide")
 st.markdown("""
     <style>
-    .stApp { background-color: #000000; color: #ffffff; }
-    [data-testid="stSidebar"] { background-color: #0a0a0a; border-right: 2px solid #1ed760; }
-    .stButton>button { background-color: #1ed760 !important; color: black !important; font-weight: bold !important; border-radius: 5px !important; }
-    h1, h2, h3 { color: #1ed760; }
-    .stDataFrame { border: 1px solid #1ed760; border-radius: 10px; }
+    .stApp { background-color: #0e1117; color: #fafafa; }
+    [data-testid="stSidebar"] { background-color: #161b22; border-right: 1px solid #30363d; }
+    .stButton>button { 
+        background: linear-gradient(135deg, #1ed760 0%, #0d8a39 100%) !important; 
+        color: white !important; 
+        font-weight: 600 !important; 
+        border-radius: 8px !important; 
+        border: none !important;
+        transition: transform 0.2s ease, box-shadow 0.2s ease !important;
+    }
+    .stButton>button:hover {
+        transform: translateY(-2px) !important;
+        box-shadow: 0 4px 12px rgba(30, 215, 96, 0.4) !important;
+    }
+    h1 { 
+        background: -webkit-linear-gradient(45deg, #1ed760, #ffffff);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        font-weight: 800;
+    }
+    h2, h3 { color: #1ed760; }
+    .stDataFrame { border: 1px solid #30363d; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
+    [data-testid="stFileUploadDropzone"] { border: 2px dashed #1ed760 !important; border-radius: 12px !important; background-color: #1c2128 !important; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -90,6 +125,62 @@ def extract_raw_data(file):
             else:
                 st.warning("⚠️ Scanned document detected, but 'easyocr' is not installed! Please run `pip install easyocr numpy` in your terminal to enable OCR.")
         return text
+
+def parse_financials_ai(text, vendor):
+    api_key = st.session_state.get('ai_key', st.secrets.get("AI_API_KEY", ""))
+    
+    if not api_key:
+        return None
+    
+    try:
+        prompt = f"""
+        Extract financial details from this invoice text for vendor '{vendor}'.
+        Return ONLY a raw JSON object (no markdown, no backticks).
+        Schema: {{"base": float, "cgst": float, "sgst": float, "igst": float, "date": "string", "invoice_no": "string", "sec": "string"}}
+        Rules:
+        - 'base' is the taxable amount BEFORE taxes. If missing, calculate Total minus taxes.
+        - 'sec' is TDS Section (194J for tech/professional, 194I for rent, 194C for contract/services/housekeeping).
+        Text:
+        {text}
+        """
+        
+        res_text = ""
+        # Determine which API to use based on key format
+        if api_key.startswith("gsk_") and HAS_GROQ:
+            client = Groq(api_key=api_key)
+            completion = client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+            )
+            res_text = completion.choices[0].message.content
+        elif HAS_GEMINI:
+            genai.configure(api_key=api_key)
+            model = genai.GenerativeModel("gemini-1.5-flash")
+            response = model.generate_content(prompt)
+            res_text = response.text
+        else:
+            return parse_financials(text, vendor)
+            
+        res_text = res_text.replace('```json', '').replace('```', '').strip()
+        # Find the first { and last } to avoid extra text
+        start_idx = res_text.find('{')
+        end_idx = res_text.rfind('}') + 1
+        if start_idx != -1 and end_idx != 0:
+            res_text = res_text[start_idx:end_idx]
+            
+        data = json.loads(res_text)
+        
+        # Ensure floats
+        for k in ["base", "cgst", "sgst", "igst"]:
+            data[k] = float(data.get(k, 0.0))
+        if not data.get("date"): data["date"] = "Not Detected"
+        if not data.get("invoice_no"): data["invoice_no"] = "Not Detected"
+        if not data.get("sec"): data["sec"] = "194C"
+        return data
+    except Exception as e:
+        st.toast(f"AI Fallback Failed: {e}")
+        return None
 
 def parse_financials(text, vendor):
     data = {"base": 0.0, "cgst": 0.0, "sgst": 0.0, "igst": 0.0, "date": "Not Detected", "invoice_no": "Not Detected", "sec": "194C"}
@@ -122,7 +213,7 @@ def parse_financials(text, vendor):
                 data["invoice_no"] = fallback_jio.group(1).strip()
     
     # 🎯 Enhanced Date Detection
-    date_match = re.search(r"(?:Invoice Date|Bill Date|Date|Dated|Period|Statement as on)\s*[:\|-]?\s*(\d{1,2}[-\/\s][a-zA-Z]{3,9}[-\/\s]\d{2,4}|\d{1,2}[-\/\s]\d{1,2}[-\/\s]\d{2,4})", clean_text, re.IGNORECASE)
+    date_match = re.search(r"(?:Invoice Date|Bill Date|Date|Dated|Period|Statement as on)[\s\:\|-]*(\d{1,2}[-\/\s][a-zA-Z]{3,9}[-\/\s]\d{2,4}|\d{1,2}[-\/\s]\d{1,2}[-\/\s]\d{2,4})", clean_text, re.IGNORECASE)
     if not date_match: 
         # Fallback
         date_match = re.search(r"\b(\d{1,2}[-\/\s](?:0?[1-9]|1[0-2]|[a-zA-Z]{3,9})[-\/\s](?:20\d{2}))\b", clean_text)
@@ -181,6 +272,21 @@ def parse_financials(text, vendor):
     elif "rakesh roshan" in vendor.lower():
         data["base"] = get_largest_amount(["Taxable Value", "Leave & License"], break_early=False)
         data["sec"] = "194I"
+    elif "rudra" in vendor.lower() or "rlfs" in vendor.lower():
+        data["base"] = get_largest_amount(["Housekeeping boy", "Housekeeping", "Rate Per Head"])
+        if data["base"] == 0.0:
+            total = get_largest_amount(["Total Rs", "Rs.", "Total"])
+            if total > 0:
+                cgst = get_largest_amount(["CGST"])
+                sgst = get_largest_amount(["SGST"])
+                data["base"] = total - cgst - sgst
+        data["sec"] = "194C"
+    elif "bse" in vendor.lower():
+        data["base"] = get_largest_amount(["EQUITY SHARE", "ALF payable", "Listing Fees", "CAPITAL"])
+        data["sec"] = "194J"
+    elif "convin" in vendor.lower() or "feed forward" in vendor.lower():
+        data["base"] = get_largest_amount(["Sub Total", "Taxable Amount", "Base Value"])
+        data["sec"] = "194J"
     
     # Broad extraction for standard invoices
     if data["base"] == 0.0:
@@ -259,7 +365,25 @@ with st.sidebar:
                     except Exception as e:
                         st.error(f"Failed to log into Google Sheet: {e}")
     else:
-        st.write(f"Logged in as: **{st.session_state['user']}**")
+        st.markdown(f"## Welcome, {st.session_state['user']}! 👋")
+        st.write("You are securely logged in.")
+        
+        st.markdown("---")
+        st.markdown("#### 🤖 AI Engine Settings")
+        
+        # Check if key is securely configured in secrets
+        if "AI_API_KEY" in st.secrets and st.secrets["AI_API_KEY"].strip() != "":
+            st.success("✅ AI Engine Active (Configured securely in backend!)")
+        else:
+            st.caption("Enter a **Groq API Key** (Llama 3) OR **Gemini API Key** for AI extraction.")
+            st.caption("💡 *If left blank, it automatically uses the upgraded Python script (Free & Offline)!*")
+            api_key_input = st.text_input("AI API Key (Groq/Gemini)", type="password")
+            if api_key_input:
+                st.session_state['ai_key'] = api_key_input
+            elif 'ai_key' in st.session_state:
+                st.success("✅ AI Engine Active!")
+            
+        st.markdown("<br>", unsafe_allow_html=True)
         if st.button("Logout"):
             st.session_state['auth'] = None
             st.rerun()
@@ -271,18 +395,45 @@ st.title("Compliance Intelligence Hub")
 files = st.file_uploader("Upload Invoices", accept_multiple_files=True)
 
 if st.button("Proceed") and files:
+    # Beautiful progress UI
+    progress_text = "Operation in progress. Please wait."
+    my_bar = st.progress(0, text=progress_text)
+    
     all_rows = []
     failed_invoices = []
     journal_rows = []
     for idx, f in enumerate(files):
+        # Update progress bar
+        my_bar.progress((idx) / len(files), text=f"⏳ Extracting data from: {f.name}")
         txt = extract_raw_data(f)
         
         # 1. Vendor Guessing from File Name
         v_guess = re.sub(r'(?i)(tax\s*invoice|invoice|bill|\.pdf).*', '', f.name).strip()
-        v = "Tata Tele" if "tata" in txt.lower() else "Reliance Jio" if "jio" in txt.lower() else "Fonada" if "fonada" in txt.lower() or "shivtel" in txt.lower() else "Decfin" if "decfin" in txt.lower() else "Karix" if "karix" in txt.lower() else "Rakesh Roshan" if "rakesh roshan" in txt.lower() else v_guess.title() if v_guess else "Vendor"
+        v = "Tata Tele" if "tata" in txt.lower() else "Reliance Jio" if "jio" in txt.lower() else "Fonada" if "fonada" in txt.lower() or "shivtel" in txt.lower() else "Decfin" if "decfin" in txt.lower() else "Karix" if "karix" in txt.lower() else "Rakesh Roshan" if "rakesh roshan" in txt.lower() else "Rudra Lines" if "rudra" in txt.lower() or "rlfs" in txt.lower() else "BSE Limited" if "bse " in txt.lower() or "bse limited" in txt.lower() else "Convin" if "feed forward" in txt.lower() or "convin" in txt.lower() else v_guess.title() if v_guess else "Vendor"
         
-        # 2. Pure Python Script Extraction
+        # 2. Try Pure Python Script Extraction First (Super Fast, Free)
         vals = parse_financials(txt, v)
+        
+        # 3. Smart AI Fallback logic
+        failed_heuristics = (
+            vals["base"] == 0.0 or 
+            vals["invoice_no"] == "Not Detected" or 
+            vals["date"] == "Not Detected" or
+            (vals["cgst"] + vals["sgst"] + vals["igst"]) > vals["base"] or
+            vals["base"] > 5000000 
+        )
+        
+        if failed_heuristics:
+            ai_vals = parse_financials_ai(txt, v)
+            if ai_vals is not None:
+                st.toast(f"Used AI Fallback for {f.name}")
+                if ai_vals["base"] > 0.0: vals["base"] = ai_vals["base"]
+                if ai_vals["cgst"] > 0.0: vals["cgst"] = ai_vals["cgst"]
+                if ai_vals["sgst"] > 0.0: vals["sgst"] = ai_vals["sgst"]
+                if ai_vals["igst"] > 0.0: vals["igst"] = ai_vals["igst"]
+                if ai_vals["invoice_no"] != "Not Detected": vals["invoice_no"] = ai_vals["invoice_no"]
+                if ai_vals["date"] != "Not Detected": vals["date"] = ai_vals["date"]
+                vals["sec"] = ai_vals["sec"]
         
         if vals["base"] == 0.0:
             st.warning(f"Could not automatically detect Base Value for {f.name}. Saving to 'Failed_Invoices' for developer review.")
@@ -332,7 +483,11 @@ if st.button("Proceed") and files:
         
         # Add Totals row and an empty gap row
         journal_rows.append({"Reference": je_ref, "Date": "", "Account": "TOTAL", "Debit": debit_total, "Credit": credit_total})
-        journal_rows.append({"Reference": "", "Date": "", "Account": "", "Debit": "", "Credit": ""})
+        journal_rows.append({"Reference": None, "Date": None, "Account": None, "Debit": None, "Credit": None})
+
+    # Finish progress bar
+    my_bar.progress(1.0, text="✅ Processing Complete!")
+    st.balloons()
 
     df = pd.DataFrame(all_rows)
     st.subheader("Extracted Invoices Data")
@@ -359,7 +514,7 @@ if st.button("Proceed") and files:
                 invoice_ws = sh.worksheet("Invoices")
             except Exception:
                 # If "Invoices" worksheet doesn't exist, create it and add headers
-                invoice_ws = sh.add_worksheet(title="Invoices", rows="1000", cols="20")
+                invoice_ws = sh.add_worksheet(title="Invoices", rows=1000, cols=20)
                 invoice_ws.append_row(df.columns.tolist())
             
             # Append the newly extracted rows to the "Invoices" sheet
@@ -373,7 +528,7 @@ if st.button("Proceed") and files:
                 try:
                     failed_ws = sh.worksheet("Failed_Invoices")
                 except Exception:
-                    failed_ws = sh.add_worksheet(title="Failed_Invoices", rows="1000", cols="3")
+                    failed_ws = sh.add_worksheet(title="Failed_Invoices", rows=1000, cols=3)
                     failed_ws.append_row(["Filename", "Timestamp", "Extracted Raw Text"])
                 failed_ws.append_rows(failed_invoices)
                 st.warning(f"⚠️ {len(failed_invoices)} complex invoice(s) were saved to the 'Failed_Invoices' sheet so the developer can create a script for them!")
