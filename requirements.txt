@@ -1,6 +1,5 @@
 streamlit
 pandas
 pdfplumber
-pytesseract
-pdf2image
-requests
+st-gsheets-connection
+cryptography
