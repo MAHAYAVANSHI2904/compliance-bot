@@ -445,7 +445,9 @@ if st.button("Proceed") and files:
         tds_amt = vals["base"] * TDS_RULES[vals["sec"]]["rate"] if is_app else 0.0
         
         gst_applicable = (vals["cgst"] > 0 or vals["sgst"] > 0 or vals["igst"] > 0)
-        net_payable = vals["base"] + vals["cgst"] + vals["sgst"] + vals["igst"] - tds_amt
+        
+        # As per user's accounting rules: Invoice value stays gross, TDS tracked separately
+        net_payable = vals["base"] + vals["cgst"] + vals["sgst"] + vals["igst"]
 
         row = {
             "Sr. No.": idx + 1, 
@@ -472,14 +474,18 @@ if st.button("Proceed") and files:
         je_ref = f"JE-{idx+1}-{vals['invoice_no'] if vals['invoice_no'] != 'Not Detected' else v}"
         
         debit_total = round(vals["base"] + vals["cgst"] + vals["sgst"] + vals["igst"], 2)
-        credit_total = round(net_payable + (tds_amt if is_app else 0.0), 2)
+        credit_total = round(net_payable, 2)
         
         journal_rows.append({"Reference": je_ref, "Date": vals["date"], "Account": "Expense A/c", "Debit": round(vals["base"], 2), "Credit": 0.0})
         if vals['cgst'] > 0: journal_rows.append({"Reference": je_ref, "Date": vals["date"], "Account": "CGST Input A/c", "Debit": round(vals['cgst'], 2), "Credit": 0.0})
         if vals['sgst'] > 0: journal_rows.append({"Reference": je_ref, "Date": vals["date"], "Account": "SGST Input A/c", "Debit": round(vals['sgst'], 2), "Credit": 0.0})
         if vals['igst'] > 0: journal_rows.append({"Reference": je_ref, "Date": vals["date"], "Account": "IGST Input A/c", "Debit": round(vals['igst'], 2), "Credit": 0.0})
+        
+        # Vendor is credited the GROSS amount
         journal_rows.append({"Reference": je_ref, "Date": vals["date"], "Account": f"{v} A/c", "Debit": 0.0, "Credit": round(net_payable, 2)})
-        if is_app: journal_rows.append({"Reference": je_ref, "Date": vals["date"], "Account": f"TDS Payable A/c ({vals['sec']})", "Debit": 0.0, "Credit": round(tds_amt, 2)})
+        
+        # TDS is now handled in a separate voucher entirely, so we remove it from this specific Journal Entry to keep Debit = Credit.
+        # if is_app: journal_rows.append({"Reference": je_ref, "Date": vals["date"], "Account": f"TDS Payable A/c ({vals['sec']})", "Debit": 0.0, "Credit": round(tds_amt, 2)})
         
         # Add Totals row and an empty gap row
         journal_rows.append({"Reference": je_ref, "Date": "", "Account": "TOTAL", "Debit": debit_total, "Credit": credit_total})
