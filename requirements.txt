@@ -7,3 +7,5 @@ gspread
 easyocr
 numpy
 opencv-python-headless
+google-generativeai
+groq
