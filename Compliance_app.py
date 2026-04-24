@@ -6,6 +6,11 @@ import json
 import io
 from datetime import datetime
 import gspread
+from compliance_engine import (
+    TDS_RULES, TDS_RULES_FULL, classify_tds_section,
+    validate_gst, validate_tds, compute_compliance_score,
+    get_tds_section_options, get_section_code
+)
 
 try:
     import easyocr
@@ -104,19 +109,20 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-TDS_RULES = {"194J": {"rate": 0.10, "limit": 30000}, "194C": {"rate": 0.02, "limit": 30000}, "194I": {"rate": 0.10, "limit": 240000}}
+# TDS_RULES now imported from compliance_engine.py (full 25+ sections)
 
 # --- 3. EXTRACTION ENGINE ---
-def extract_raw_data(file):
+def extract_raw_data(file, first_page_only=False):
     with pdfplumber.open(file) as pdf:
-        text = "\n".join([page.extract_text() or "" for page in pdf.pages])
+        pages_to_scan = [pdf.pages[0]] if first_page_only else pdf.pages
+        text = "\n".join([page.extract_text() or "" for page in pages_to_scan])
         
         if len(text.strip()) < 50:
             reader = get_ocr_reader()
             if reader:
-                st.info(f"Scanning image for {file.name} using EasyOCR...")
+                st.info(f"Scanning {'first page' if first_page_only else 'image'} for {file.name} using EasyOCR...")
                 ocr_text = ""
-                for page in pdf.pages:
+                for page in pages_to_scan:
                     pil_image = page.to_image(resolution=150).original
                     img_array = np.array(pil_image)
                     result = reader.readtext(img_array, detail=0, paragraph=True)
@@ -273,13 +279,18 @@ def parse_financials(text, vendor):
         data["base"] = get_largest_amount(["Taxable Value", "Leave & License"], break_early=False)
         data["sec"] = "194I"
     elif "rudra" in vendor.lower() or "rlfs" in vendor.lower():
-        data["base"] = get_largest_amount(["Housekeeping boy", "Housekeeping", "Rate Per Head"])
+        data["base"] = get_largest_amount(["Housekeeping boy", "Housekeeping", "Rate Per Head", "Sub Total", "Taxable Value"])
         if data["base"] == 0.0:
             total = get_largest_amount(["Total Rs", "Rs.", "Total"])
             if total > 0:
                 cgst = get_largest_amount(["CGST"])
                 sgst = get_largest_amount(["SGST"])
-                data["base"] = total - cgst - sgst
+                calc_base = total - cgst - sgst
+                if calc_base > 0:
+                    data["base"] = calc_base
+                    # IMPORTANT: Save these GST values directly so extract_taxes() doesn't lose them
+                    if cgst > 0: data["cgst"] = cgst
+                    if sgst > 0: data["sgst"] = sgst
         data["sec"] = "194C"
     elif "bse" in vendor.lower():
         data["base"] = get_largest_amount(["EQUITY SHARE", "ALF payable", "Listing Fees", "CAPITAL"])
@@ -329,7 +340,14 @@ def parse_financials(text, vendor):
         
         return cgst, sgst, igst
 
-    data["cgst"], data["sgst"], data["igst"] = extract_taxes(data["base"])
+    # Only run generic tax extraction if vendor-specific logic hasn't already populated GST
+    if data["cgst"] == 0.0 and data["sgst"] == 0.0 and data["igst"] == 0.0:
+        data["cgst"], data["sgst"], data["igst"] = extract_taxes(data["base"])
+    else:
+        # Validate the already-set values make sense; if not, try extracting again
+        total_existing = data["cgst"] + data["sgst"] + data["igst"]
+        if total_existing > data["base"]:  # Impossible — taxes > base, re-extract
+            data["cgst"], data["sgst"], data["igst"] = extract_taxes(data["base"])
     
     return data
 
@@ -396,18 +414,167 @@ with st.sidebar:
 
 if not st.session_state['auth']: st.stop()
 
+# ── Session state init ──────────────────────────────────────────────────────
+for key in ['dup_decisions', 'processing_approved', 'vendor_master']:
+    if key not in st.session_state:
+        st.session_state[key] = {} if key != 'processing_approved' else False
+
+# ── Helper: Load existing invoices from GSheet for duplicate check ────────
+@st.cache_data(ttl=60)
+def load_existing_invoices(_sh):
+    try:
+        ws = _sh.worksheet("Invoices")
+        records = ws.get_all_records()
+        return records
+    except Exception:
+        return []
+
+# ── Helper: Extract vendor info fields from invoice text ──────────────────
+def extract_vendor_info(text: str, vendor_name: str) -> dict:
+    info = {"Vendor Name": vendor_name, "GST Number": "", "Address": "",
+            "MSME/Udyam Number": "", "PAN": ""}
+    # GSTIN
+    gstin_match = re.search(
+        r'\b(\d{2}[A-Z]{5}\d{4}[A-Z]{1}[A-Z\d]{1}Z[A-Z\d]{1})\b', text.upper())
+    if gstin_match:
+        info["GST Number"] = gstin_match.group(1)
+    # PAN (from GSTIN digits 3-12 or standalone)
+    if info["GST Number"]:
+        info["PAN"] = info["GST Number"][2:12]
+    else:
+        pan_match = re.search(r'\b([A-Z]{5}\d{4}[A-Z]{1})\b', text.upper())
+        if pan_match: info["PAN"] = pan_match.group(1)
+    # MSME/Udyam
+    udyam_match = re.search(
+        r'\b(UDYAM-[A-Z]{2}-\d{2}-\d{7})\b', text.upper())
+    if udyam_match:
+        info["MSME/Udyam Number"] = udyam_match.group(1)
+    # Address — grab 2 lines after keywords
+    addr_match = re.search(
+        r'(?:address|registered office|office)\s*[:\-]?\s*(.{10,150})',
+        text, re.IGNORECASE)
+    if addr_match:
+        info["Address"] = addr_match.group(1).strip()[:200]
+    return info
+
 # --- 5. DATA HUB ---
 st.title("Compliance Intelligence Hub")
 files = st.file_uploader("Upload Invoices", accept_multiple_files=True)
 
 if st.button("Proceed") and files:
-    # Beautiful progress UI
+    # Clear previous results if new processing starts
+    if 'results' in st.session_state:
+        del st.session_state['results']
+
+    # ── PHASE 1: Pre-scan for duplicates ─────────────────────────────────
+    sh = None
+    existing_invoices = []
+    if not isinstance(log_worksheet, str):
+        sh = log_worksheet.spreadsheet
+        existing_invoices = load_existing_invoices(sh)
+
+    # Normalise invoice number for robust comparison (strips spaces/dashes/slashes)
+    def norm_inv(s: str) -> str:
+        return re.sub(r'[\s\-\/\\]', '', str(s)).upper().strip()
+
+    existing_inv_nos = {
+        norm_inv(r.get("Invoice Number", "")): r
+        for r in existing_invoices
+        if r.get("Invoice Number", "") not in ("", "Not Detected", None)
+    }
+
+    # Quick-extract invoice numbers for all uploaded files to do pre-check
+    st.session_state['dup_decisions'] = {}
+    duplicates_found = []
+
+    with st.spinner("Pre-scanning for duplicates (first page only for speed)..."):
+        for f in files:
+            # Fast read for duplicate check
+            full_txt = extract_raw_data(f, first_page_only=True)
+            
+            # Normalise OCR noise: collapse multiple spaces, fix common OCR artefacts
+            clean_scan = re.sub(r'[ \t]{2,}', ' ', full_txt)   # multi-spaces → single
+            clean_scan = re.sub(r'(?<=[A-Z0-9])\s(?=[A-Z0-9])', '', clean_scan)  # 'I N V' → 'INV'
+            
+            # Multi-pattern invoice number extractor (handles OCR & digital PDFs)
+            INV_PATTERNS = [
+                r'(?:Invoice|Inv)[\s\.]*(?:No|Number|#|No\.)[\s:\-#\.]*([A-Z0-9][\w\-\/]{2,28})',
+                r'(?:Bill|Receipt|Tax Invoice)[\s]*(?:No|Number|#)[\s:\-#]*([A-Z0-9][\w\-\/]{2,28})',
+                r'(?:Ref(?:erence)?|Order)[\s]*(?:No|Number)[\s:\-#]*([A-Z0-9][\w\-\/]{2,28})',
+                r'\b([A-Z]{2,6}[\-\/]?\d{4,6}[\-\/]?\d{0,6})\b',  # Generic: ABC-2025-001
+            ]
+            
+            quick_inv_no = None
+            for pattern in INV_PATTERNS:
+                m = re.search(pattern, clean_scan, re.IGNORECASE)
+                if m:
+                    candidate = norm_inv(m.group(1))
+                    # Ignore if it looks like a year/date/PINcode only
+                    if len(candidate) >= 4 and not re.fullmatch(r'\d{4,6}', candidate):
+                        quick_inv_no = candidate
+                        break
+            
+            # Check against normalised existing invoice numbers
+            if quick_inv_no and quick_inv_no in existing_inv_nos:
+                duplicates_found.append((f.name, quick_inv_no, existing_inv_nos[quick_inv_no]))
+            else:
+                st.session_state['dup_decisions'][f.name] = 'process'  # auto-approved
+
+    # ── PHASE 2: Show duplicate comparison UI ────────────────────────────
+    if duplicates_found:
+        st.markdown("---")
+        st.subheader("⚠️ Duplicate Invoice Alert — Your Review Required")
+        st.caption("The following invoices already exist in Google Sheets. Compare and decide.")
+
+        for fname, inv_no, old_row in duplicates_found:
+            with st.expander(f"🔴 Possible Duplicate: **{fname}** — Invoice No: `{inv_no}`", expanded=True):
+                col_old, col_new = st.columns(2)
+                with col_old:
+                    st.markdown("**📁 EXISTING RECORD (in Google Sheets)**")
+                    st.markdown(f"- **Invoice No:** `{old_row.get('Invoice Number', 'N/A')}`")
+                    st.markdown(f"- **Vendor:** {old_row.get('Vendor', 'N/A')}")
+                    st.markdown(f"- **Date:** {old_row.get('Invoice Date', 'N/A')}")
+                    st.markdown(f"- **Base Value:** ₹{old_row.get('Base Value', 'N/A')}")
+                    st.markdown(f"- **Net Payable:** ₹{old_row.get('Net Payable', 'N/A')}")
+                    st.markdown(f"- **Processed By:** {old_row.get('Processed By', 'N/A')}")
+                    st.markdown(f"- **Timestamp:** {old_row.get('Timestamp', 'N/A')}")
+                with col_new:
+                    st.markdown("**📄 NEW UPLOAD (from your PDF)**")
+                    st.info("Values will be extracted during processing. "
+                            "Review the old record on the left and decide below.")
+
+                decision = st.radio(
+                    f"What to do with `{fname}`?",
+                    options=["⏭️ SKIP — It is a duplicate, don't upload again",
+                             "✅ FORCE PROCESS — It is a corrected/different invoice, upload it"],
+                    key=f"dup_{fname}"
+                )
+                st.session_state['dup_decisions'][fname] = (
+                    'skip' if decision.startswith('⏭️') else 'process'
+                )
+
+        st.markdown("---")
+        if st.button("✅ Confirm Decisions & Start Processing", type="primary"):
+            st.session_state['processing_approved'] = True
+            st.rerun()
+        st.stop()
+
+    st.session_state['processing_approved'] = True
+
+if st.session_state.get('processing_approved') and files:
+    sh = None
+    if not isinstance(log_worksheet, str):
+        sh = log_worksheet.spreadsheet
+
     progress_text = "Operation in progress. Please wait."
     my_bar = st.progress(0, text=progress_text)
     
-    all_rows = []
-    failed_invoices = []
-    journal_rows = []
+    # Pre-calculate TDS summary to store in state later
+    batch_all_rows = []
+    batch_journal_rows = []
+    batch_vendor_info_rows = []
+    batch_failed_invoices = []
+
     for idx, f in enumerate(files):
         # Update progress bar
         my_bar.progress((idx) / len(files), text=f"⏳ Extracting data from: {f.name}")
@@ -482,7 +649,8 @@ if st.button("Proceed") and files:
                     is_app = True
                     tds_reason = "Future Planning"
                     
-        tds_amt = vals["base"] * TDS_RULES[vals["sec"]]["rate"] if is_app else 0.0
+        tds_rate = TDS_RULES.get(vals["sec"], TDS_RULES["194C"])["rate"]
+        tds_amt = vals["base"] * tds_rate if is_app else 0.0
         
         gst_applicable = (vals["cgst"] > 0 or vals["sgst"] > 0 or vals["igst"] > 0)
         
@@ -499,8 +667,9 @@ if st.button("Proceed") and files:
             "SGST": vals["sgst"],
             "IGST": vals["igst"],
             "TDS Section": vals["sec"],
+            "TDS Section Desc": TDS_RULES_FULL.get(vals["sec"], {}).get("desc", ""),
             "TDS Deducted": "Yes" if is_app else "No",
-            "TDS Rate": f"{int(TDS_RULES[vals['sec']]['rate'] * 100)}%" if is_app else "NA",
+            "TDS Rate": f"{tds_rate * 100:.1f}%" if is_app else "NA",
             "TDS Amount": tds_amt if is_app else 0.0,
             "TDS Reason": tds_reason,
             "GST Reason": "Applicable" if gst_applicable else "Not Applicable",
@@ -508,76 +677,177 @@ if st.button("Proceed") and files:
             "Processed By": st.session_state['user'],
             "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
-        all_rows.append(row)
-
-        # Build Journal Entry Rows for DataFrame
-        je_ref = f"JE-{idx+1}-{vals['invoice_no'] if vals['invoice_no'] != 'Not Detected' else v}"
         
+        # Run compliance validations
+        gst_res = validate_gst(vals["base"], vals["cgst"], vals["sgst"], vals["igst"], txt)
+        tds_res = validate_tds(vals["base"], vals["sec"], is_app, tds_amt, txt, vals["date"])
+        score, score_label = compute_compliance_score(gst_res, tds_res)
+        row["Compliance Score"] = score
+        row["Compliance Status"] = score_label
+        batch_all_rows.append(row)
+        
+        # Extract and store vendor info
+        vinfo = extract_vendor_info(txt, v)
+        vinfo["Invoice Number"] = vals["invoice_no"]
+        vinfo["Invoice Date"] = vals["date"]
+        batch_vendor_info_rows.append(vinfo)
+
+        # Journal Entry logic
+        je_ref = f"JE-{idx+1}-{vals['invoice_no'] if vals['invoice_no'] != 'Not Detected' else v}"
         debit_total = round(vals["base"] + vals["cgst"] + vals["sgst"] + vals["igst"], 2)
         credit_total = round(net_payable, 2)
         
-        journal_rows.append({"Reference": je_ref, "Date": vals["date"], "Account": "Expense A/c", "Debit": round(vals["base"], 2), "Credit": 0.0})
-        if vals['cgst'] > 0: journal_rows.append({"Reference": je_ref, "Date": vals["date"], "Account": "CGST Input A/c", "Debit": round(vals['cgst'], 2), "Credit": 0.0})
-        if vals['sgst'] > 0: journal_rows.append({"Reference": je_ref, "Date": vals["date"], "Account": "SGST Input A/c", "Debit": round(vals['sgst'], 2), "Credit": 0.0})
-        if vals['igst'] > 0: journal_rows.append({"Reference": je_ref, "Date": vals["date"], "Account": "IGST Input A/c", "Debit": round(vals['igst'], 2), "Credit": 0.0})
-        
-        # Vendor is credited the GROSS amount
-        journal_rows.append({"Reference": je_ref, "Date": vals["date"], "Account": f"{v} A/c", "Debit": 0.0, "Credit": round(net_payable, 2)})
-        
-        # TDS is now handled in a separate voucher entirely, so we remove it from this specific Journal Entry to keep Debit = Credit.
-        # if is_app: journal_rows.append({"Reference": je_ref, "Date": vals["date"], "Account": f"TDS Payable A/c ({vals['sec']})", "Debit": 0.0, "Credit": round(tds_amt, 2)})
-        
-        # Add Totals row and an empty gap row
-        journal_rows.append({"Reference": je_ref, "Date": "", "Account": "TOTAL", "Debit": debit_total, "Credit": credit_total})
-        journal_rows.append({"Reference": None, "Date": None, "Account": None, "Debit": None, "Credit": None})
+        batch_journal_rows.append({"Reference": je_ref, "Date": vals["date"], "Account": "Expense A/c", "Debit": round(vals["base"], 2), "Credit": 0.0})
+        if vals['cgst'] > 0: batch_journal_rows.append({"Reference": je_ref, "Date": vals["date"], "Account": "CGST Input A/c", "Debit": round(vals['cgst'], 2), "Credit": 0.0})
+        if vals['sgst'] > 0: batch_journal_rows.append({"Reference": je_ref, "Date": vals["date"], "Account": "SGST Input A/c", "Debit": round(vals['sgst'], 2), "Credit": 0.0})
+        if vals['igst'] > 0: batch_journal_rows.append({"Reference": je_ref, "Date": vals["date"], "Account": "IGST Input A/c", "Debit": round(vals['igst'], 2), "Credit": 0.0})
+        batch_journal_rows.append({"Reference": je_ref, "Date": vals["date"], "Account": f"{v} A/c", "Debit": 0.0, "Credit": round(net_payable, 2)})
+        batch_journal_rows.append({"Reference": je_ref, "Date": "", "Account": "TOTAL", "Debit": debit_total, "Credit": credit_total})
+        batch_journal_rows.append({"Reference": None, "Date": None, "Account": None, "Debit": None, "Credit": None})
 
-    # Finish progress bar
+    # Finish processing
     my_bar.progress(1.0, text="✅ Processing Complete!")
     st.balloons()
-
-    df = pd.DataFrame(all_rows)
-    st.subheader("Extracted Invoices Data")
-    st.dataframe(df, use_container_width=True)
     
-    je_df = pd.DataFrame(journal_rows)
+    # Store everything in session state so it survives the 'Download' rerun
+    st.session_state['results'] = {
+        'all_rows': batch_all_rows,
+        'journal_rows': batch_journal_rows,
+        'vendor_info_rows': batch_vendor_info_rows,
+        'failed_invoices': batch_failed_invoices
+    }
     
-    col1, col2 = st.columns(2)
-    with col1:
-        csv = df.to_csv(index=False).encode('utf-8')
-        st.download_button(label="📥 Download Data (CSV)", data=csv, file_name='invoices_data.csv', mime='text/csv')
-    
-    with st.expander("Show Journal Entries (Sheet View)"):
-        st.dataframe(je_df, use_container_width=True)
-        je_csv = je_df.to_csv(index=False).encode('utf-8')
-        st.download_button(label="📥 Download Journal Entries (CSV)", data=je_csv, file_name='journal_entries.csv', mime='text/csv')
-
-    # Auto Cloud Sync using working gspread connection
-    if not isinstance(log_worksheet, str): # ensure we have a valid connection
+    # ── Auto Cloud Sync using working gspread connection ───────────────
+    if sh is not None:
         try:
             st.info("Syncing data to Google Sheets...")
-            sh = log_worksheet.spreadsheet
+            df_sync = pd.DataFrame(batch_all_rows)
+            # --- Sheet 1: Invoices ---
             try:
                 invoice_ws = sh.worksheet("Invoices")
             except Exception:
-                # If "Invoices" worksheet doesn't exist, create it and add headers
-                invoice_ws = sh.add_worksheet(title="Invoices", rows=1000, cols=20)
-                invoice_ws.append_row(df.columns.tolist())
-            
-            # Append the newly extracted rows to the "Invoices" sheet
-            if len(df) > 0:
-                df_to_upload = df.fillna("").astype(str)
+                invoice_ws = sh.add_worksheet(title="Invoices", rows=2000, cols=25)
+                invoice_ws.append_row(df_sync.columns.tolist())
+            if len(df_sync) > 0:
+                df_to_upload = df_sync.fillna("").astype(str)
                 invoice_ws.append_rows(df_to_upload.values.tolist())
-                st.success("✅ Processed invoices synced to Google Sheets!")
-            
-            # Save failed invoices for developer review
-            if failed_invoices:
+
+            # --- Sheet 2: Vendor_Master ---
+            if batch_vendor_info_rows:
+                try:
+                    vendor_ws = sh.worksheet("Vendor_Master")
+                except Exception:
+                    vendor_ws = sh.add_worksheet(title="Vendor_Master", rows=1000, cols=10)
+                    vendor_ws.append_row(["Sr. No.", "Vendor Name", "GST Number", "PAN", "MSME/Udyam Number", "Address", "Invoice Number", "Invoice Date", "Added On"])
+                existing_vendors = {r.get("GST Number", "") for r in vendor_ws.get_all_records()}
+                new_vendor_rows = []
+                for i, vi in enumerate(batch_vendor_info_rows, 1):
+                    gst = vi.get("GST Number", "")
+                    if gst and gst not in existing_vendors:
+                        new_vendor_rows.append([i, vi["Vendor Name"], vi.get("GST Number", ""), vi.get("PAN", ""), vi.get("MSME/Udyam Number", ""), vi.get("Address", ""), vi.get("Invoice Number", ""), vi.get("Invoice Date", ""), datetime.now().strftime("%Y-%m-%d %H:%M")])
+                if new_vendor_rows: vendor_ws.append_rows(new_vendor_rows)
+
+            # --- Sheet 4: Failed_Invoices ---
+            if batch_failed_invoices:
                 try:
                     failed_ws = sh.worksheet("Failed_Invoices")
                 except Exception:
                     failed_ws = sh.add_worksheet(title="Failed_Invoices", rows=1000, cols=3)
                     failed_ws.append_row(["Filename", "Timestamp", "Extracted Raw Text"])
-                failed_ws.append_rows(failed_invoices)
-                st.warning(f"⚠️ {len(failed_invoices)} complex invoice(s) were saved to the 'Failed_Invoices' sheet so the developer can create a script for them!")
-                
+                failed_ws.append_rows(batch_failed_invoices)
         except Exception as e:
             st.error(f"Google Sheets Sync Failure: {e}")
+
+    st.session_state['processing_approved'] = False
+    st.session_state['dup_decisions'] = {}
+    st.rerun()
+
+
+# --- 6. RESULTS DASHBOARD ---
+if 'results' in st.session_state:
+    res = st.session_state['results']
+    all_rows = res['all_rows']
+    journal_rows = res['journal_rows']
+    vendor_info_rows = res['vendor_info_rows']
+    
+    st.markdown("---")
+    col_res_a, col_res_b = st.columns([0.8, 0.2])
+    with col_res_a:
+        st.subheader("📑 Processing Results")
+    with col_res_b:
+        if st.button("🗑️ Clear Results"):
+            del st.session_state['results']
+            st.rerun()
+
+    df = pd.DataFrame(all_rows)
+    st.subheader("📋 Extracted Invoices Data")
+    st.dataframe(df, use_container_width=True)
+    
+    # ── Download Buttons ───────────────────────────────────────────────────────
+    je_df = pd.DataFrame(journal_rows)
+    dl_col1, dl_col2, dl_col3 = st.columns(3)
+    with dl_col1:
+        csv = df.to_csv(index=False).encode('utf-8')
+        st.download_button(label="📥 Download Invoice Data (CSV)", data=csv, file_name='invoices_data.csv', mime='text/csv', use_container_width=True)
+    with dl_col2:
+        je_csv = je_df.to_csv(index=False).encode('utf-8')
+        st.download_button(label="📥 Download Journal Entries (CSV)", data=je_csv, file_name='journal_entries.csv', mime='text/csv', use_container_width=True)
+    with dl_col3:
+        with st.expander("📒 View Journal Entries Table"):
+            st.dataframe(je_df, use_container_width=True)
+
+    # ── TDS Payable Summary ────────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("📊 TDS Payable Summary")
+    st.caption("Aggregate TDS liability by section")
+    tds_summary = {}
+    for row in all_rows:
+        if row.get("TDS Deducted") == "Yes":
+            sec = row.get("TDS Section", "NA")
+            desc = row.get("TDS Section Desc", "")
+            if sec not in tds_summary:
+                tds_summary[sec] = {"Section": sec, "Description": desc, "No. of Invoices": 0, "Total Base (₹)": 0.0, "TDS Rate": row.get("TDS Rate", ""), "Total TDS Payable (₹)": 0.0, "Deposit Due Date": "7th of next month"}
+            tds_summary[sec]["No. of Invoices"] += 1
+            tds_summary[sec]["Total Base (₹)"] += float(row.get("Base Value", 0) or 0)
+            tds_summary[sec]["Total TDS Payable (₹)"] += float(row.get("TDS Amount", 0) or 0)
+    
+    if tds_summary:
+        tds_sum_df = pd.DataFrame(list(tds_summary.values()))
+        st.dataframe(tds_sum_df, use_container_width=True)
+        tds_sum_csv = tds_sum_df.to_csv(index=False).encode('utf-8')
+        st.download_button("📥 Download TDS Summary (CSV)", data=tds_sum_csv, file_name='tds_summary.csv', mime='text/csv')
+
+    # ── Vendor Information Register ───────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("🏢 Vendor Information Register")
+    vinfo_df = pd.DataFrame(vendor_info_rows)
+    st.dataframe(vinfo_df, use_container_width=True)
+
+    # ── Compliance Validation Dashboard ────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("🛡️ Compliance Validation Dashboard")
+    for row in all_rows:
+        inv_name = row.get("Invoice Number", "Invoice")
+        vendor_name = row.get("Vendor", "")
+        base, cgst, sgst, igst = row["Base Value"], row["CGST"], row["SGST"], row["IGST"]
+        sec, is_tds, tds_a = row["TDS Section"], row["TDS Deducted"] == "Yes", row["TDS Amount"]
+        status, score = row["Compliance Status"], row["Compliance Score"]
+        
+        with st.expander(f"{status} — {vendor_name} | Invoice: {inv_name}"):
+            gst_res = validate_gst(base, cgst, sgst, igst)
+            tds_res = validate_tds(base, sec, is_tds, tds_a)
+            tab1, tab2, tab3 = st.tabs(["GST Checks", "TDS Checks", "Section Reference"])
+            with tab1:
+                for rule, (passed, msg) in gst_res.items():
+                    if passed is True: st.success(msg)
+                    elif passed is False: st.error(msg)
+                    else: st.warning(msg)
+            with tab2:
+                for rule, (passed, msg) in tds_res.items():
+                    if passed is True: st.success(msg)
+                    elif passed is False: st.error(msg)
+                    else: st.info(msg)
+            with tab3:
+                sec_info = TDS_RULES_FULL.get(sec, {})
+                st.markdown(f"**Section {sec}: {sec_info.get('desc', 'N/A')}**")
+                st.markdown(f"- **Rate:** {sec_info.get('rate', 0)*100:.1f}% | **Threshold:** ₹{sec_info.get('limit', 0):,.0f}")
