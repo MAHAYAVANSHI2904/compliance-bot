@@ -299,19 +299,25 @@ def parse_financials(text, vendor):
         if base_val <= 0: return 0.0, 0.0, 0.0
         all_nums = [float(n) for n in re.findall(r"(\d+(?:\.\d{1,2})?)", clean_text) if float(n) > 0]
         
+        has_cgst = "CGST" in clean_text.upper()
+        has_sgst = "SGST" in clean_text.upper()
+        has_igst = "IGST" in clean_text.upper()
+        
+        # Check CGST/SGST first (9%, 6%, 2.5%, 14%) if they are explicitly in the invoice
+        if has_cgst or has_sgst:
+            for rate in [0.09, 0.06, 0.025, 0.14]:
+                expected = base_val * rate
+                matched = [n for n in all_nums if abs(n - expected) <= 0.5]
+                if matched:
+                    return max(matched), max(matched), 0.0
+                    
         # Check IGST (18%, 12%, 5%, 28%)
-        for rate in [0.18, 0.12, 0.05, 0.28]:
-            expected = base_val * rate
-            matched = [n for n in all_nums if abs(n - expected) <= 2.0]
-            if matched and "IGST" in clean_text.upper():
-                return 0.0, 0.0, max(matched)
-                
-        # Check CGST/SGST (9%, 6%, 2.5%, 14%)
-        for rate in [0.09, 0.06, 0.025, 0.14]:
-            expected = base_val * rate
-            matched = [n for n in all_nums if abs(n - expected) <= 2.0]
-            if matched:
-                return max(matched), max(matched), 0.0
+        if has_igst and not (has_cgst or has_sgst):
+            for rate in [0.18, 0.12, 0.05, 0.28]:
+                expected = base_val * rate
+                matched = [n for n in all_nums if abs(n - expected) <= 0.5]
+                if matched:
+                    return 0.0, 0.0, max(matched)
                 
         # Fallback if mathematical doesn't match perfectly
         cgst = get_largest_amount(["CGST"])
