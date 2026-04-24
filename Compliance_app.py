@@ -455,7 +455,33 @@ if st.button("Proceed") and files:
             with st.expander(f"View Raw Extracted Text from {f.name}"):
                 st.text(txt if txt.strip() else "NO TEXT DETECTED (This appears to be a scanned image, not a digital PDF)")
         
-        is_app = vals["base"] >= TDS_RULES[vals["sec"]]["limit"]
+        # 5. Smart TDS Applicability (Human Mindset / Future Planning)
+        limit = TDS_RULES[vals["sec"]]["limit"]
+        is_app = vals["base"] >= limit
+        tds_reason = "Applicable" if is_app else "Below Limit"
+        
+        if not is_app and vals["date"] != "Not Detected":
+            month_match = re.search(r'(?i)(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)', vals["date"])
+            month_num = None
+            if month_match:
+                months = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+                month_num = months.index(month_match.group(1).lower()) + 1
+            else:
+                parts = re.split(r'[-/.\s]', vals["date"])
+                if len(parts) >= 2:
+                    try:
+                        m = int(parts[1])
+                        if 1 <= m <= 12: month_num = m
+                    except: pass
+            
+            # If invoice is in early-to-mid Financial Year (April = 4, up to September = 9)
+            if month_num and 4 <= month_num <= 9:
+                months_remaining = 16 - month_num # E.g., April (4) -> 12 months left
+                projected_annual = vals["base"] * months_remaining
+                if projected_annual >= limit:
+                    is_app = True
+                    tds_reason = "Future Planning"
+                    
         tds_amt = vals["base"] * TDS_RULES[vals["sec"]]["rate"] if is_app else 0.0
         
         gst_applicable = (vals["cgst"] > 0 or vals["sgst"] > 0 or vals["igst"] > 0)
@@ -476,7 +502,7 @@ if st.button("Proceed") and files:
             "TDS Deducted": "Yes" if is_app else "No",
             "TDS Rate": f"{int(TDS_RULES[vals['sec']]['rate'] * 100)}%" if is_app else "NA",
             "TDS Amount": tds_amt if is_app else 0.0,
-            "TDS Reason": "Applicable" if is_app else "Below Limit",
+            "TDS Reason": tds_reason,
             "GST Reason": "Applicable" if gst_applicable else "Not Applicable",
             "Net Payable": net_payable,
             "Processed By": st.session_state['user'],
