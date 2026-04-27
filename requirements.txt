@@ -11,3 +11,5 @@ google-generativeai
 groq
 fpdf
 plotly
+pymupdf
+Pillow
