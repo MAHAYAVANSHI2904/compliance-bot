@@ -536,6 +536,16 @@ def main():
                         scores = data.get("confidence_scores", {})
                         avg_score = sum(float(v) for v in scores.values() if isinstance(v, (int, float))) / len(scores) if scores else 0
                         
+                        base_v = float(data.get("base_value", 0.0) or 0.0)
+                        cgst_v = float(data.get("cgst_amount", 0.0) or 0.0)
+                        sgst_v = float(data.get("sgst_amount", 0.0) or 0.0)
+                        igst_v = float(data.get("igst_amount", 0.0) or 0.0)
+                        cess_v = float(data.get("cess_amount", 0.0) or 0.0)
+                        tds_v  = float(tds_info.get("amount") or data.get("tds_amount") or 0.0)
+                        
+                        gross_v = base_v + cgst_v + sgst_v + igst_v + cess_v
+                        net_v   = gross_v - tds_v
+
                         res = {
                             "Sr. No.": idx + 1,
                             "Vendor": data.get("vendor", "N/A"),
@@ -543,18 +553,18 @@ def main():
                             "Invoice #": data.get("invoice_number", "N/A"),
                             "Invoice Date": data.get("invoice_date", "N/A"),
                             "Nature": data.get("invoice_nature", "N/A"),
-                            "Base Value": data.get("base_value", 0.0),
-                            "CGST": data.get("cgst_amount", 0.0),
-                            "SGST": data.get("sgst_amount", 0.0),
-                            "IGST": data.get("igst_amount", 0.0),
+                            "Base Value": base_v,
+                            "CGST": cgst_v,
+                            "SGST": sgst_v,
+                            "IGST": igst_v,
                             "Supply Type": audit.get("supply_type", "N/A"),
                             "ITC Status": "CLAIMABLE" if audit.get("itc_eligible") else "BLOCKED",
                             "RCM": "YES" if (audit.get("rcm_alert") or data.get("rcm_applicable") == "yes") else "NO",
                             "TDS Section (Old)": tds_info.get("old_section") or tds_info.get("section") or data.get("tds_section") or "N/A",
                             "New Section (393)": tds_info.get("new_section", "N/A"),
                             "TDS %": tds_info.get("base_rate") or tds_info.get("rate") or (f"{data.get('tds_rate', 0.0)}%" if data.get('tds_rate') else "0.0%"),
-                            "TDS Deduction": tds_info.get("amount") or data.get("tds_amount") or 0.0,
-                            "Net Payable": data.get("net_payable") or (data.get("total", 0.0) - (tds_info.get("amount") or data.get("tds_amount") or 0.0)),
+                            "TDS Deduction": tds_v,
+                            "Net Payable": net_v,
                             "TDS Reason": data.get("tds_reason") or tds_info.get("note") or "Verified",
                             "GST Reason": data.get("gst_reason") or (" / ".join(audit.get("flags", [])) if audit.get("flags") else "Compliant"),
                             "_raw_data": data
