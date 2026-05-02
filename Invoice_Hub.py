@@ -259,6 +259,7 @@ def extract_with_groq(file_bytes, file_name, api_key):
                 - net_payable (total minus tds_amount)
                 - line_items (list of objects with description, hsn_sac, quantity, rate, amount)
                 - irn (Invoice Reference Number if present)
+                - bank_name, account_number, ifsc_code, bank_branch (Vendor's bank details for payments)
                 
                 Guidelines:
                 - If a field is missing, return null.
@@ -565,6 +566,9 @@ def main():
                             "TDS %": tds_info.get("base_rate") or tds_info.get("rate") or (f"{data.get('tds_rate', 0.0)}%" if data.get('tds_rate') else "0.0%"),
                             "TDS Deduction": tds_v,
                             "Net Payable": net_v,
+                            "Bank Name": data.get("bank_name", "N/A"),
+                            "A/c No": data.get("account_number", "N/A"),
+                            "IFSC": data.get("ifsc_code", "N/A"),
                             "TDS Reason": data.get("tds_reason") or tds_info.get("note") or "Verified",
                             "GST Reason": data.get("gst_reason") or (" / ".join(audit.get("flags", [])) if audit.get("flags") else "Compliant"),
                             "_raw_data": data
