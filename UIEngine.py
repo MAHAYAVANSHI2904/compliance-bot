@@ -45,6 +45,8 @@ html, body, [class*="css"] {
 #MainMenu {visibility: hidden;}
 footer {visibility: hidden;}
 header {visibility: hidden;}
+div[data-testid="stToolbar"] {display: none;}
+div[data-testid="stDecoration"] {display: none;}
 .main .block-container {
     background-color: #0d0e14 !important;
     padding-top: 28px !important;
