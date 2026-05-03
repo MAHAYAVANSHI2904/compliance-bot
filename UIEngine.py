@@ -42,11 +42,13 @@ html, body, [class*="css"] {
     background-color: #0d0e14 !important;
     color: #e4e6f0 !important;
 }
-#MainMenu {visibility: hidden;}
-footer {visibility: hidden;}
-header {visibility: hidden;}
-div[data-testid="stToolbar"] {display: none;}
-div[data-testid="stDecoration"] {display: none;}
+#MainMenu {visibility: hidden !important;}
+footer {visibility: hidden !important;}
+header {visibility: hidden !important;}
+div[data-testid="stToolbar"] {display: none !important;}
+div[data-testid="stDecoration"] {display: none !important;}
+div[data-testid="stStatusWidget"] {display: none !important;}
+[data-testid="stStatusWidget"] {display: none !important;}
 .main .block-container {
     background-color: #0d0e14 !important;
     padding-top: 28px !important;
