@@ -6,8 +6,10 @@ import gspread
 from google.oauth2.service_account import Credentials
 from datetime import datetime
 import streamlit as st
+import sqlite3
 import os
 
+DB_PATH = "invoice_forensics.db"
 SCOPES = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 SHEET_ID = "1j7U1Kw0NG2I77V19S0vIRqDqIFYCFdXIPE7wSDSfulQ"
 CREDS_FILE = os.path.join(os.path.dirname(__file__), "credentials.json")
@@ -185,17 +187,55 @@ def upsert_vendor(data: dict, audit: dict, is_non_filer: bool = False):
                 flags
             ]
             ws.append_row(new_row)
+            
+        # DUAL REDUNDANCY: Also sync to local SQLite
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            pan_val = str(data.get("pan") or gstin[2:12] if len(gstin) >= 12 else "N/A")
+            nature_val = str(data.get("invoice_nature") or "N/A")
+            risk_val = "HIGH" if is_non_filer else "LOW"
+            
+            c.execute("""
+                INSERT INTO vendor_master (gstin, vendor_name, pan, nature_of_supply, default_tds_section, risk_206ab, msme_status)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(gstin) DO UPDATE SET
+                    vendor_name = excluded.vendor_name,
+                    pan = excluded.pan,
+                    nature_of_supply = excluded.nature_of_supply,
+                    default_tds_section = excluded.default_tds_section,
+                    risk_206ab = excluded.risk_206ab,
+                    msme_status = excluded.msme_status,
+                    last_sync = CURRENT_TIMESTAMP
+            """, (gstin, vendor_name, pan_val, nature_val, tds_sec, risk_val, str(data.get("msme_registered") or "Unknown")))
+            conn.commit()
+            conn.close()
+        except:
+            pass
+            
     except Exception as e:
         st.warning(f"Vendor master update failed: {e}")
 
 def get_vendor_master() -> list:
-    """Return all vendors from Vendor_Master sheet."""
+    """Return all vendors from Vendor_Master sheet, fallback to SQLite."""
     try:
         ss = get_spreadsheet()
-        if not ss: return []
-        ws = _get_or_create_sheet(ss, "Vendor_Master", VENDOR_HEADERS)
-        records = ws.get_all_records()
-        return records
+        if ss:
+            ws = _get_or_create_sheet(ss, "Vendor_Master", VENDOR_HEADERS)
+            records = ws.get_all_records()
+            return records
+    except Exception as e:
+        st.sidebar.warning(f"Sheets fetch failed, falling back to SQL: {e}")
+    
+    # Fallback to local SQL
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute("SELECT * FROM vendor_master")
+        rows = c.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
     except:
         return []
 
@@ -259,3 +299,20 @@ def get_token_summary() -> dict:
         }
     except:
         return {}
+
+def update_vendor_master(all_results: list):
+    """Batch upsert unique vendors from a list of audit results."""
+    try:
+        seen_vendors = {}
+        for res in all_results:
+            d = res.get("_raw_data")
+            if not d: continue
+            gstin = d.get("vendor_gstin")
+            if gstin:
+                # Store most recent data for each unique GSTIN
+                seen_vendors[gstin] = (d, d.get("compliance_audit", {}))
+        
+        for gstin, (d, audit) in seen_vendors.items():
+            upsert_vendor(d, audit)
+    except Exception as e:
+        log_error("SheetsConnector.update_vendor_master", str(e))
