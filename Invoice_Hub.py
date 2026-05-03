@@ -144,14 +144,14 @@ def main():
                     now = datetime.now()
                     # If today is <= 7th, deadline is 7th of this month. Otherwise, 7th of next month.
                     if now.day <= 7:
-                        deadline_dt = now
+                        deadline_dt = now.replace(day=7)
                     else:
                         if now.month == 12:
                             deadline_dt = now.replace(year=now.year + 1, month=1, day=7)
                         else:
                             deadline_dt = now.replace(month=now.month + 1, day=7)
                     
-                    deadline_str = deadline_dt.strftime("%#d %B") # e.g. "7 May"
+                    deadline_str = deadline_dt.strftime("%d %B") # e.g. "07 May"
                     st.info(f"📅 **{deadline_str} deadline**: ₹{total_tds:,.0f} TDS payable to govt based on current session.")
                     
             with tabs[3]: # GST Summary
