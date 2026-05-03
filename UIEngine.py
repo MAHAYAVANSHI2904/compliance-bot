@@ -42,6 +42,9 @@ html, body, [class*="css"] {
     background-color: #0d0e14 !important;
     color: #e4e6f0 !important;
 }
+#MainMenu {visibility: hidden;}
+footer {visibility: hidden;}
+header {visibility: hidden;}
 .main .block-container {
     background-color: #0d0e14 !important;
     padding-top: 28px !important;
