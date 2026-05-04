@@ -641,3 +641,4 @@ def render_json_intelligence(data: dict):
         html_code += f"<div style='background: #16181f; padding: 10px 14px; border-radius: 6px; border: 1px solid #242736;'><div style='font-size: 11px; color: #818cf8; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px;'>{display_key}</div><div style='font-size: 13px; color: {val_color}; font-family: monospace; word-break: break-word;'>{display_val}</div></div>"
     html_code += "</div>"
     st.markdown(html_code, unsafe_allow_html=True)
+
