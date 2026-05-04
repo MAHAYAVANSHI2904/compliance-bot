@@ -11,6 +11,7 @@ import textwrap
 PAGES = [
     "Scan Invoice",
     "Dashboard",
+    "Research",
 ]
 
 NAV_ICON = {
@@ -24,7 +25,7 @@ NAV_ICON = {
 }
 
 NAV_SECTIONS = {
-    "Menu":  ["Scan Invoice", "Dashboard"],
+    "Menu":  ["Scan Invoice", "Dashboard", "Research"],
 }
 
 # ══════════════════════════════════════════════════════════════
@@ -44,16 +45,7 @@ html, body, [class*="css"] {
 }
 #MainMenu {visibility: hidden !important;}
 footer {visibility: hidden !important;}
-header {visibility: hidden !important;}
-div[data-testid="stToolbar"] {display: none !important;}
-div[data-testid="stDecoration"] {display: none !important;}
-div[data-testid="stStatusWidget"] {display: none !important;}
-[data-testid="stStatusWidget"] {display: none !important;}
-.main .block-container {
-    background-color: #0d0e14 !important;
-    padding-top: 28px !important;
-    max-width: 1300px;
-}
+/* Resetting layout to restore sidebar */
 
 /* ─── LOGIN CARD ────────────────────────────────────────────── */
 .login-wrap {
@@ -93,8 +85,6 @@ div[data-testid="stStatusWidget"] {display: none !important;}
 [data-testid="stSidebar"] {
     background-color: #111318 !important;
     border-right: 1px solid #1e2030 !important;
-    min-width: 240px !important; max-width: 240px !important;
-    padding: 0 !important;
 }
 [data-testid="stSidebar"] > div { padding: 0 !important; }
 [data-testid="stSidebar"] [data-testid="stVerticalBlock"] { gap: 0 !important; }
@@ -220,23 +210,7 @@ div[data-testid="stStatusWidget"] {display: none !important;}
     padding: 4px 10px; border-radius: 20px;
 }
 
-/* ─── GOOGLE SEARCH FOOTER ──────────────────────────────────── */
-.google-bar {
-    margin-top: 40px; padding-top: 24px;
-    border-top: 1px solid #1e2030;
-}
-.google-bar-title {
-    font-size: 12px; font-weight: 600; letter-spacing: 1px;
-    text-transform: uppercase; color: #4b5563; margin-bottom: 12px;
-}
-.google-link {
-    display: inline-block; padding: 9px 20px;
-    background: #16181f; border: 1px solid #1e2030;
-    color: #818cf8 !important; border-radius: 8px;
-    text-decoration: none; font-size: 13px; font-weight: 500;
-    transition: border-color 0.2s, background 0.2s;
-}
-.google-link:hover { border-color: #4f6ef7; background: #1a2245; }
+
 
 /* ─── COMPLIANCE CARDS ──────────────────────────────────────── */
 .score-green  { color: #94a3b8; font-weight: 700; font-size: 18px; }
@@ -373,12 +347,7 @@ def inject_css():
     st.markdown(GLOBAL_CSS, unsafe_allow_html=True)
 
 
-# ══════════════════════════════════════════════════════════════
-#  GOOGLE SEARCH FOOTER (added at bottom of every page)
-# ══════════════════════════════════════════════════════════════
-def render_google_footer(prefill: str = ""):
-    """Disabled global footer — moved to TDS Summary tab."""
-    pass
+
 
 
 # ══════════════════════════════════════════════════════════════
@@ -449,6 +418,7 @@ def render_sidebar(user_name: str) -> str:
             st.session_state.processed_results = []
             st.session_state.vendor_totals = {}
             st.session_state.chat_history = []
+            st.session_state.pop('vendor_master_cache', None)
             st.rerun()
 
     return st.session_state.active_page
@@ -527,11 +497,21 @@ def render_page_header(title: str, badge: str = "LIVE", icon_svg: str = ""):
 def render_scan_result_card(res: dict, score: int, emoji: str, css_cls: str, checklist: list):
     """Renders the premium forensic card for an individual invoice scan as a single unit."""
     
+    d = res.get("_raw_data", {})
+    needs_review = d.get("_needs_review", False)
+    
+    if needs_review:
+        badge_html = '<span style="background: rgba(239, 68, 68, 0.1); color: #ef4444; border: 1px solid rgba(239, 68, 68, 0.2); padding: 2px 6px; border-radius: 4px; font-size: 9px; margin-left: 8px;">⚠️ LOW CONFIDENCE — VERIFY MANUALLY</span>'
+        status_text = "Needs Verification"
+    else:
+        badge_html = ''
+        status_text = "Verified Invoice"
+
     # Build the main header and stats grid
     html = f"""<div class="scan-result-card">
 <div class="scan-header">
 <div>
-<div style="font-size: 11px; color: #4f6ef7; text-transform: uppercase; letter-spacing: 1.5px; font-weight: 700; margin-bottom: 4px;">Verified Invoice</div>
+<div style="font-size: 11px; color: #4f6ef7; text-transform: uppercase; letter-spacing: 1.5px; font-weight: 700; margin-bottom: 4px;">{status_text}{badge_html}</div>
 <div style="font-size: 22px; font-weight: 700; color: #e4e6f0;">{res.get('Vendor', 'N/A')}</div>
 <div class="scan-meta">
 <span># {res.get('Invoice #', 'N/A')}</span>
@@ -637,25 +617,7 @@ def render_findings(findings: list):
             </div>
         """, unsafe_allow_html=True)
 
-def render_smart_search(audit: dict, tds_info: dict, data: dict):
-    """Contextual Google research buttons."""
-    import urllib.parse
-    tds_sec = (tds_info.get("old_section") or tds_info.get("section") or "").upper()
-    flags = audit.get("flags", [])
-    
-    links = []
-    if tds_sec and tds_sec != "N/A":
-        links.append((f"🔍 Sec {tds_sec}", f"TDS Section {tds_sec} income tax India"))
-    for f in flags:
-        links.append((f"🔍 {f[:15]}...", f"{f} income tax GST India"))
-    
-    if links:
-        links = links[:4]  # Cap at 4 max to prevent column crash
-        cols = st.columns(len(links))
-        for i, (label, query) in enumerate(links):
-            url = f"https://www.google.com/search?q={urllib.parse.quote_plus(query)}"
-            with cols[i]:
-                st.markdown(f"<a href='{url}' target='_blank' class='google-link' style='width:100%; text-align:center;'>{label}</a>", unsafe_allow_html=True)
+
 
 def render_json_intelligence(data: dict):
     """Renders the raw JSON data in a modern, Space Grey forensic grid instead of st.json."""
