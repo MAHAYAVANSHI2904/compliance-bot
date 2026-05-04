@@ -1279,3 +1279,4 @@ def get_action_checklist(data: dict, audit: dict, tds_info: dict, res: dict) -> 
     if net > 0: items.append({"text": f"📍 Pay Net ₹{net:,.0f}", "priority": "ok"})
     for flag in audit.get("flags", []): items.append({"text": f"📍 {flag}", "priority": "warn"})
     return items
+    
