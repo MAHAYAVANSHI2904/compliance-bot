@@ -1,5 +1,5 @@
 import re
-print("DEBUG: Loading ComplianceEngine.py V4.1...")
+
 import fitz
 import cv2
 import numpy as np
@@ -12,14 +12,53 @@ import SheetsConnector
 import sqlite3
 import os
 
-# --- SQLITE INIT ---
+# --- DATABASE ABSTRACTION (Supabase Postgres & Local SQLite Support) ---
 DB_PATH = os.path.join(os.path.dirname(__file__), "invoice_forensics.db")
+
+def get_db_engine():
+    import streamlit as st
+    try:
+        if "supabase" in st.secrets.get("connections", {}):
+            return st.connection("supabase", type="sql").engine
+        elif "db" in st.secrets.get("connections", {}):
+            return st.connection("db", type="sql").engine
+        else:
+            return st.connection("sqlite", type="sql", url=f"sqlite:///{DB_PATH}").engine
+    except Exception:
+        import sqlalchemy
+        return sqlalchemy.create_engine(f"sqlite:///{DB_PATH}")
+
+def db_execute(query: str, params: tuple = ()):
+    engine = get_db_engine()
+    is_postgres = "postgres" in engine.url.drivername
+    
+    if is_postgres:
+        if "AUTOINCREMENT" in query:
+            query = query.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
+        if "INSERT OR IGNORE INTO" in query:
+            query = query.replace("INSERT OR IGNORE INTO", "INSERT INTO")
+            if "ON CONFLICT" not in query:
+                # Add conflict ignore for Postgres unique constraint
+                query += " ON CONFLICT DO NOTHING"
+        
+        with engine.raw_connection() as conn:
+            cursor = conn.cursor()
+            pg_query = query.replace("?", "%s")
+            cursor.execute(pg_query, params)
+            conn.commit()
+            try: return cursor.fetchall()
+            except: return None
+    else:
+        with engine.raw_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(query, params)
+            conn.commit()
+            try: return cursor.fetchall()
+            except: return None
 
 def init_db():
     try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute('''
+        db_execute('''
             CREATE TABLE IF NOT EXISTS processed_invoices (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 invoice_number TEXT,
@@ -27,11 +66,11 @@ def init_db():
                 base_value REAL,
                 tds_section TEXT,
                 fy TEXT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(invoice_number, vendor_gstin, base_value)
             )
         ''')
-        c.execute('''
+        db_execute('''
             CREATE TABLE IF NOT EXISTS vendor_master (
                 gstin TEXT PRIMARY KEY,
                 vendor_name TEXT,
@@ -40,38 +79,61 @@ def init_db():
                 default_tds_section TEXT,
                 risk_206ab TEXT DEFAULT 'LOW',
                 msme_status TEXT DEFAULT 'NO',
-                last_sync DATETIME DEFAULT CURRENT_TIMESTAMP
+                last_sync TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
-        conn.commit()
-        conn.close()
+        db_execute('''
+            CREATE TABLE IF NOT EXISTS challan_master (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                vendor_gstin TEXT,
+                section TEXT,
+                amount REAL,
+                due_date DATE,
+                challan_number TEXT,
+                deposited_date DATE,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        db_execute('''
+            CREATE TABLE IF NOT EXISTS gst_ledger (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                invoice_number TEXT,
+                vendor_gstin TEXT,
+                cgst REAL,
+                sgst REAL,
+                igst REAL,
+                total_gst REAL,
+                fy TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(invoice_number, vendor_gstin)
+            )
+        ''')
+        try: db_execute("ALTER TABLE processed_invoices ADD COLUMN user_id TEXT DEFAULT 'DEFAULT'")
+        except: pass
+        try: db_execute("ALTER TABLE processed_invoices ADD COLUMN raw_json TEXT")
+        except: pass
+        try: db_execute("ALTER TABLE gst_ledger ADD COLUMN user_id TEXT DEFAULT 'DEFAULT'")
+        except: pass
+        try: db_execute("ALTER TABLE challan_master ADD COLUMN user_id TEXT DEFAULT 'DEFAULT'")
+        except: pass
     except Exception:
         pass
 
 init_db()
 
-def get_194c_aggregate(vendor_gstin: str, fy: str = "2025-26") -> float:
+def get_194c_aggregate(vendor_gstin: str, fy: str = "2025-26", user_id="DEFAULT") -> float:
     try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("SELECT SUM(base_value) FROM processed_invoices WHERE vendor_gstin = ? AND fy = ? AND tds_section = '194C'", 
-                  (str(vendor_gstin).strip().upper(), fy))
-        res = c.fetchone()[0]
-        conn.close()
-        return float(res) if res else 0.0
+        res = db_execute("SELECT SUM(base_value) FROM processed_invoices WHERE vendor_gstin = ? AND fy = ? AND tds_section = '194C' AND user_id = ?", 
+                  (str(vendor_gstin).strip().upper(), fy, user_id))
+        return float(res[0][0]) if res and res[0][0] else 0.0
     except Exception:
         return 0.0
 
-def clear_session_invoices(session_start_dt: datetime):
+def clear_session_invoices(session_start_dt: datetime, user_id="DEFAULT"):
     """Delete rows inserted during this active session only."""
     try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        # SQLite timestamps are UTC by default in CURRENT_TIMESTAMP
-        # We compare against the datetime object passed from main
-        c.execute("DELETE FROM processed_invoices WHERE timestamp >= ?", (session_start_dt,))
-        conn.commit()
-        conn.close()
+        db_execute("DELETE FROM processed_invoices WHERE timestamp >= ? AND user_id = ?", (session_start_dt, user_id))
+        db_execute("DELETE FROM gst_ledger WHERE timestamp >= ? AND user_id = ?", (session_start_dt, user_id))
     except Exception:
         pass
 
@@ -630,13 +692,9 @@ def _check_msme_terms(data: dict) -> str | None:
 def _check_duplicate_invoice(invoice_number: str, vendor_gstin: str, base: float) -> str | None:
     """V4 Check: Session-level duplicate invoice detection."""
     try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("SELECT 1 FROM processed_invoices WHERE invoice_number=? AND vendor_gstin=? AND base_value=?",
+        res = db_execute("SELECT 1 FROM processed_invoices WHERE invoice_number=? AND vendor_gstin=? AND base_value=?",
                   (str(invoice_number).strip().upper(), str(vendor_gstin).strip().upper(), float(base)))
-        res = c.fetchone()
-        conn.close()
-        if res:
+        if res and len(res) > 0:
             return f"C19 DUPLICATE: Invoice #{invoice_number} from {vendor_gstin} already processed"
         return None
     except Exception:
@@ -695,7 +753,7 @@ def _supply_type(data, total_tax, base):
 # MAIN ENGINE
 # =============================================================
 
-def perform_compliance_audit(data, manual_206ab_verification_flag=False, vendor_history_total=0.0):
+def perform_compliance_audit(data, manual_206ab_verification_flag=False, vendor_history_total=0.0, user_id="DEFAULT"):
     audit = {
         "gst_compliance": "COMPLIANT",
         "flags": [],
@@ -744,8 +802,17 @@ def perform_compliance_audit(data, manual_206ab_verification_flag=False, vendor_
         for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%d %b %Y"):
             try:
                 dt = datetime.strptime(inv_date_str, fmt)
-                if not (datetime(2025, 4, 1) <= dt <= datetime(2026, 3, 31)):
-                    audit["flags"].append("Wrong FY — verify before booking.")
+                # Dynamic FY validation
+                now_check = datetime.now()
+                if now_check.month <= 3:
+                    fy_start = datetime(now_check.year - 1, 4, 1)
+                    fy_end   = datetime(now_check.year, 3, 31)
+                else:
+                    fy_start = datetime(now_check.year, 4, 1)
+                    fy_end   = datetime(now_check.year + 1, 3, 31)
+
+                if not (fy_start <= dt <= fy_end):
+                    audit["flags"].append(f"Wrong FY — verify before booking (Expected {fy_start.year}-{str(fy_end.year)[2:]}).")
                 break
             except ValueError:
                 pass
@@ -939,6 +1006,11 @@ def perform_compliance_audit(data, manual_206ab_verification_flag=False, vendor_
             tan_field = str(data.get("vendor_tan", "")).strip().lower()
             if calc_amt > 0 and (not tan_field or tan_field == "n/a"):
                 audit["flags"].append("TAN missing — deductee liable for 30% u/s 206AA.")
+            
+            # V4 Check 15: AI vs Engine TDS Reconciliation
+            tds_reconcile = _check_tds_vs_ai(base, ai_tds_amount, calc_amt, section.split("_")[0])
+            if tds_reconcile:
+                audit["flags"].append(tds_reconcile)
 
         audit["tds_details"].append({
             "section":     section.split("_")[0],
@@ -992,12 +1064,10 @@ def perform_compliance_audit(data, manual_206ab_verification_flag=False, vendor_
         fy_str = f"{now.year}-{str(now.year+1)[2:]}"
 
     try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("INSERT INTO processed_invoices (invoice_number, vendor_gstin, base_value, tds_section, fy) VALUES (?, ?, ?, ?, ?)",
-                  (str(data.get("invoice_number", "")).strip().upper(), vendor_gstin, base, tds_sec, fy_str))
-        conn.commit()
-        conn.close()
+        db_execute("INSERT OR IGNORE INTO processed_invoices (invoice_number, vendor_gstin, base_value, tds_section, fy, timestamp, user_id, raw_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                  (str(data.get("invoice_number", "")).strip().upper(), vendor_gstin, base, tds_sec, fy_str, datetime.now(), user_id, json.dumps(data)))
+        db_execute("INSERT OR IGNORE INTO gst_ledger (invoice_number, vendor_gstin, cgst, sgst, igst, total_gst, fy, timestamp, user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                  (str(data.get("invoice_number", "")).strip().upper(), vendor_gstin, cgst, sgst, igst, total_tax, fy_str, datetime.now(), user_id))
     except:
         pass
         
@@ -1200,7 +1270,9 @@ def get_action_checklist(data: dict, audit: dict, tds_info: dict, res: dict) -> 
     net     = float(res.get("Net Payable", 0) or 0)
     tds_sec = tds_info.get("section", "N/A")
     gst_total = float(data.get("cgst_amount", 0) or 0) + float(data.get("sgst_amount", 0) or 0) + float(data.get("igst_amount", 0) or 0)
-    if tds_amt > 0: items.append({"text": f"📍 Deduct ₹{tds_amt:,.0f} TDS (Sec {tds_sec})", "priority": "urgent"})
+    if tds_amt > 0: 
+        items.append({"text": f"📍 Deduct ₹{tds_amt:,.0f} TDS (Sec {tds_sec})", "priority": "urgent"})
+        items.append({"text": f"📍 Verify TDS reflects in vendor's 26AS/AIS before filing return", "priority": "warn"})
     if audit.get("206ab_confirmed") == True: items.append({"text": "📍 Verify 206AB ITR status", "priority": "urgent"})
     if audit.get("itc_eligible") and gst_total > 0: items.append({"text": f"📍 Claim ₹{gst_total:,.0f} GST ITC", "priority": "ok"})
     if audit.get("rcm_alert"): items.append({"text": "📍 Pay RCM GST", "priority": "warn"})
